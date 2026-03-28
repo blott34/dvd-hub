@@ -7,12 +7,22 @@
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
-  body {
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     background: #0a0a0a;
     color: #e2e8f0;
     min-height: 100vh;
     -webkit-font-smoothing: antialiased;
+  }
+
+  #app {
+    width: 100%;
+    max-width: 100%;
+    margin: 0;
+    padding: 0;
   }
 
   .page-header {
@@ -40,9 +50,10 @@
   .page-meta span { margin: 0 10px; }
 
   .content {
-    display: block;
     width: 100%;
-    padding: 24px 48px 48px;
+    max-width: 100%;
+    padding: 24px;
+    box-sizing: border-box;
   }
 
   .content > * { margin-bottom: 20px; }
@@ -322,6 +333,7 @@
 </style>
 </head>
 <body>
+<div id="header" class="page-header" style="display:none;"></div>
 <div id="app" class="loading-screen">Loading dashboard...</div>
 
 <script>
@@ -474,16 +486,20 @@ async function loadDashboard() {
   });
   const ppRange = fmtDateRange(pp.start, pp.end);
 
-  document.getElementById('app').innerHTML = `
-    <div class="page-header">
-      <h1>DVD Hub — Owner Dashboard</h1>
-      <div class="page-meta">
-        <span>${esc(dateStr)}</span>
-        <span>Pay Period: ${ppRange}</span>
-        <span>Auto-refreshes every 60s</span>
-      </div>
+  const header = document.getElementById('header');
+  header.style.display = '';
+  header.innerHTML = `
+    <h1>DVD Hub — Owner Dashboard</h1>
+    <div class="page-meta">
+      <span>${esc(dateStr)}</span>
+      <span>Pay Period: ${ppRange}</span>
+      <span>Auto-refreshes every 60s</span>
     </div>
+  `;
 
+  const app = document.getElementById('app');
+  app.className = '';
+  app.innerHTML = `
     <div class="content">
       <!-- Daily + Pay Period Overviews side by side -->
       <div class="row">
