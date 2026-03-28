@@ -1,11 +1,9 @@
 import { useState } from 'react';
-import { createBrowserRouter, RouterProvider } from 'react-router-dom';
 import LoginScreen from './pages/LoginScreen';
 import ScannerDashboard from './pages/ScannerDashboard';
 import CleanerDashboard from './pages/CleanerDashboard';
-import OwnerDashboard from './pages/OwnerDashboard';
 
-function EmployeeApp() {
+export default function App() {
   const [employee, setEmployee] = useState(null);
 
   if (!employee) {
@@ -19,13 +17,4 @@ function EmployeeApp() {
   }
 
   return <CleanerDashboard onLogout={handleLogout} />;
-}
-
-const router = createBrowserRouter([
-  { path: '/owner', element: <OwnerDashboard /> },
-  { path: '*', element: <EmployeeApp /> },
-]);
-
-export default function App() {
-  return <RouterProvider router={router} />;
 }

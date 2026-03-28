@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DVD Hub - Owner Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 28px 40px 20px;
+    border-bottom: 1px solid #1e293b;
+  }
+
+  header h1 { font-size: 24px; font-weight: 700; color: #f8fafc; }
+
+  .header-right {
+    display: flex;
+    align-items: baseline;
+    gap: 20px;
+  }
+
+  .header-date { font-size: 14px; color: #94a3b8; }
+
+  .refresh-note {
+    font-size: 11px;
+    color: #475569;
+    letter-spacing: 0.3px;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    padding: 28px 40px 48px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+
+  .section {
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 24px;
+    border: 1px solid #334155;
+  }
+
+  .section.wide { grid-column: 1 / -1; }
+
+  .section h2 {
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: #94a3b8;
+    margin-bottom: 18px;
+    font-weight: 600;
+  }
+
+  /* Stats row */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+  }
+
+  .stat {
+    text-align: center;
+    padding: 16px 8px;
+    background: #0f172a;
+    border-radius: 8px;
+  }
+
+  .stat-val {
+    font-size: 32px;
+    font-weight: 700;
+    color: #f8fafc;
+    line-height: 1;
+  }
+
+  .stat-lbl {
+    font-size: 12px;
+    color: #94a3b8;
+    margin-top: 6px;
+  }
+
+  .green { color: #4ade80; }
+  .red   { color: #f87171; }
+  .blue  { color: #60a5fa; }
+
+  /* Employee cards */
+  .emp-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+
+  .emp-card {
+    background: #0f172a;
+    border-radius: 8px;
+    padding: 18px;
+  }
+
+  .emp-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+
+  .emp-name { font-weight: 600; font-size: 15px; color: #f8fafc; }
+
+  .emp-role {
+    font-size: 12px;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-weight: 600;
+    background: #334155;
+    color: #94a3b8;
+  }
+
+  .emp-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    margin-bottom: 6px;
+  }
+
+  .dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+
+  .dot.in  { background: #4ade80; box-shadow: 0 0 6px #4ade8080; }
+  .dot.out { background: #6b7280; }
+
+  .emp-hours {
+    font-size: 20px;
+    font-weight: 700;
+    color: #f8fafc;
+    margin-top: 8px;
+  }
+
+  /* Tables */
+  .table-wrap { overflow-x: auto; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+
+  th {
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 2px solid #334155;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #94a3b8;
+    font-weight: 600;
+  }
+
+  td {
+    padding: 10px 12px;
+    border-bottom: 1px solid #1e293b;
+    color: #e2e8f0;
+  }
+
+  tbody tr:hover { background: #334155; }
+
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .badge-ready { background: #312e81; color: #a5b4fc; }
+  .badge-done  { background: #14532d; color: #4ade80; }
+
+  /* Costs */
+  .costs-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+
+  .cost-block {
+    background: #0f172a;
+    border-radius: 8px;
+    padding: 16px;
+  }
+
+  .cost-block h4 {
+    font-size: 13px;
+    color: #94a3b8;
+    margin-bottom: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+
+  .cost-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 0;
+    font-size: 14px;
+    color: #cbd5e1;
+  }
+
+  .cost-row.total {
+    border-top: 1px solid #334155;
+    margin-top: 6px;
+    padding-top: 10px;
+    font-weight: 700;
+    color: #f8fafc;
+    font-size: 16px;
+  }
+
+  /* Alerts */
+  .alert-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    background: #450a0a;
+    border: 1px solid #7f1d1d;
+    border-radius: 8px;
+    margin-bottom: 8px;
+  }
+
+  .alert-item:last-child { margin-bottom: 0; }
+  .alert-name { font-weight: 600; color: #fca5a5; }
+
+  .alert-stock {
+    font-size: 14px;
+    color: #f87171;
+    font-weight: 600;
+  }
+
+  .alert-trigger {
+    font-weight: 400;
+    color: #94a3b8;
+    font-size: 12px;
+  }
+
+  .empty {
+    text-align: center;
+    padding: 24px;
+    color: #64748b;
+    font-size: 14px;
+  }
+
+  .empty.ok { color: #4ade80; }
+
+  .loading-screen {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-size: 18px;
+    color: #94a3b8;
+  }
+
+  @media (max-width: 900px) {
+    .grid { grid-template-columns: 1fr; padding: 20px; }
+    .stats { grid-template-columns: repeat(3, 1fr); }
+    header { padding: 20px; flex-direction: column; gap: 4px; }
+  }
+</style>
+</head>
+<body>
+<div id="app" class="loading-screen">Loading dashboard...</div>
+
+<script>
+const SUPABASE_URL = 'https://lfwrlwetayyqcfyggmfi.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imxmd3Jsd2V0YXl5cWNmeWdnbWZpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ2MTU2MDMsImV4cCI6MjA5MDE5MTYwM30.DoAFrX2e--_4poKoOgegiK26gQY3mY17oBYLmhZAcPQ';
+
+async function query(table, params = '') {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${params}`, {
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+    },
+  });
+  return res.json();
+}
+
+function todayISO() {
+  return new Date().toISOString().split('T')[0];
+}
+
+function weekAgoISO() {
+  const d = new Date();
+  d.setDate(d.getDate() - 7);
+  return d.toISOString().split('T')[0];
+}
+
+function startOfDayISO() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+}
+
+function fmtDate(d) {
+  return new Date(d + 'T00:00:00').toLocaleDateString('en-US', {
+    weekday: 'short', month: 'short', day: 'numeric',
+  });
+}
+
+function fmtShortDate(ts) {
+  return new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function esc(s) {
+  const el = document.createElement('span');
+  el.textContent = s;
+  return el.innerHTML;
+}
+
+async function loadDashboard() {
+  const today = todayISO();
+  const weekAgo = weekAgoISO();
+  const sod = startOfDayISO();
+
+  const [logs, shipDone, timesheets, batches, shipCosts, supplies, weekly] = await Promise.all([
+    query('daily_log', `select=result&timestamp=gte.${sod}`),
+    query('shipments_completed', `select=id&date=eq.${today}`),
+    query('timesheet', `select=*&date=eq.${today}&order=time_in.asc`),
+    query('shipments_ready', `select=*&order=timestamp.desc&limit=30`),
+    query('shipments_completed', `select=date,placement_fee,shipping_fee&date=gte.${weekAgo}`),
+    query('supply_tracker', `select=*&order=item.asc`),
+    query('daily_summary', `select=*&date=gte.${weekAgo}&order=date.desc`),
+  ]);
+
+  // Daily overview
+  const passed = logs.filter(r => r.result === 'Pass').length;
+  const failed = logs.filter(r => r.result === 'Fail').length;
+  const total = logs.length;
+  const passRate = total > 0 ? Math.round((passed / total) * 100) : 0;
+  const shipCount = shipDone.length;
+
+  // Employee status
+  const employees = {};
+  for (const emp of ['Scanner', 'Cleaner']) {
+    const rows = timesheets.filter(r => r.employee === emp);
+    const hours = rows.reduce((s, r) => s + (parseFloat(r.hours_worked) || 0), 0);
+    const last = rows[rows.length - 1];
+    const clockedIn = last ? (last.time_in && !last.time_out) : false;
+    employees[emp] = { clockedIn, hours };
+  }
+
+  // Costs
+  const todayCosts = shipCosts.filter(r => r.date === today);
+  const costData = {
+    tp: todayCosts.reduce((s, r) => s + (parseFloat(r.placement_fee) || 0), 0),
+    ts: todayCosts.reduce((s, r) => s + (parseFloat(r.shipping_fee) || 0), 0),
+    wp: shipCosts.reduce((s, r) => s + (parseFloat(r.placement_fee) || 0), 0),
+    ws: shipCosts.reduce((s, r) => s + (parseFloat(r.shipping_fee) || 0), 0),
+  };
+
+  // Supply alerts
+  const alerts = supplies.filter(s => s.current_stock <= s.order_trigger);
+
+  // Render
+  const dateStr = new Date().toLocaleDateString('en-US', {
+    weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
+  });
+
+  document.getElementById('app').innerHTML = `
+    <header>
+      <h1>DVD Hub — Owner Dashboard</h1>
+      <div class="header-right">
+        <span class="header-date">${esc(dateStr)}</span>
+        <span class="refresh-note">Auto-refreshes every 60s</span>
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- Daily Overview -->
+      <section class="section">
+        <h2>Daily Overview</h2>
+        <div class="stats">
+          <div class="stat">
+            <div class="stat-val">${total}</div>
+            <div class="stat-lbl">Total Scans</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val green">${passed}</div>
+            <div class="stat-lbl">Passes</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val red">${failed}</div>
+            <div class="stat-lbl">Fails</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val">${passRate}%</div>
+            <div class="stat-lbl">Pass Rate</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val blue">${shipCount}</div>
+            <div class="stat-lbl">Shipments</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Employee Status -->
+      <section class="section">
+        <h2>Employee Status</h2>
+        <div class="emp-grid">
+          ${['Scanner', 'Cleaner'].map((emp, i) => `
+            <div class="emp-card">
+              <div class="emp-header">
+                <span class="emp-name">Employee ${i + 1}</span>
+                <span class="emp-role">${emp}</span>
+              </div>
+              <div class="emp-status">
+                <span class="dot ${employees[emp].clockedIn ? 'in' : 'out'}"></span>
+                <span>${employees[emp].clockedIn ? 'Clocked In' : 'Clocked Out'}</span>
+              </div>
+              <div class="emp-hours">${employees[emp].hours.toFixed(1)}h today</div>
+            </div>
+          `).join('')}
+        </div>
+      </section>
+
+      <!-- Shipments Pipeline -->
+      <section class="section wide">
+        <h2>Shipments Pipeline</h2>
+        ${batches.length === 0
+          ? '<div class="empty">No batches in pipeline</div>'
+          : `<div class="table-wrap"><table>
+              <thead><tr>
+                <th>Date</th><th>Quantity</th><th>Status</th><th>SKUs Listed</th><th>Gap</th>
+              </tr></thead>
+              <tbody>${batches.map(b => {
+                const gap = b.status === 'COMPLETED' && b.skus_listed != null
+                  ? b.quantity - b.skus_listed : null;
+                return `<tr>
+                  <td>${fmtShortDate(b.timestamp)}</td>
+                  <td>${b.quantity}</td>
+                  <td><span class="badge ${b.status === 'READY' ? 'badge-ready' : 'badge-done'}">${esc(b.status)}</span></td>
+                  <td>${b.skus_listed != null ? b.skus_listed : '--'}</td>
+                  <td>${gap != null
+                    ? `<span class="${gap > 0 ? 'red' : 'green'}">${gap > 0 ? gap + ' unlisted' : 'All listed'}</span>`
+                    : '<span style="color:#6b7280">--</span>'
+                  }</td>
+                </tr>`;
+              }).join('')}</tbody>
+            </table></div>`
+        }
+      </section>
+
+      <!-- Shipment Costs -->
+      <section class="section">
+        <h2>Shipment Costs</h2>
+        <div class="costs-grid">
+          <div class="cost-block">
+            <h4>Today</h4>
+            <div class="cost-row"><span>Placement Fees</span><span>$${costData.tp.toFixed(2)}</span></div>
+            <div class="cost-row"><span>Shipping Fees</span><span>$${costData.ts.toFixed(2)}</span></div>
+            <div class="cost-row total"><span>Total</span><span>$${(costData.tp + costData.ts).toFixed(2)}</span></div>
+          </div>
+          <div class="cost-block">
+            <h4>This Week</h4>
+            <div class="cost-row"><span>Placement Fees</span><span>$${costData.wp.toFixed(2)}</span></div>
+            <div class="cost-row"><span>Shipping Fees</span><span>$${costData.ws.toFixed(2)}</span></div>
+            <div class="cost-row total"><span>Total</span><span>$${(costData.wp + costData.ws).toFixed(2)}</span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Supply Alerts -->
+      <section class="section">
+        <h2>Supply Alerts</h2>
+        ${alerts.length === 0
+          ? '<div class="empty ok">All supplies above trigger levels</div>'
+          : alerts.map(s => `
+            <div class="alert-item">
+              <span class="alert-name">${esc(s.item)}</span>
+              <span class="alert-stock">${s.current_stock} ${esc(s.unit)}
+                <span class="alert-trigger"> (trigger: ${s.order_trigger})</span>
+              </span>
+            </div>
+          `).join('')
+        }
+      </section>
+
+      <!-- Weekly Summary -->
+      <section class="section wide">
+        <h2>Weekly Summary</h2>
+        ${weekly.length === 0
+          ? '<div class="empty">No summary data available</div>'
+          : `<div class="table-wrap"><table>
+              <thead><tr>
+                <th>Date</th><th>Total Scans</th><th>Passes</th><th>Fails</th><th>Pass Rate</th><th>Shipments</th>
+              </tr></thead>
+              <tbody>${weekly.map(d => {
+                const t = (d.passes || 0) + (d.fails || 0);
+                const r = t > 0 ? Math.round(((d.passes || 0) / t) * 100) : 0;
+                return `<tr>
+                  <td>${fmtDate(d.date)}</td>
+                  <td>${d.total_scans != null ? d.total_scans : t}</td>
+                  <td class="green">${d.passes || 0}</td>
+                  <td class="red">${d.fails || 0}</td>
+                  <td>${d.pass_rate != null ? d.pass_rate : r}%</td>
+                  <td>${d.shipments || 0}</td>
+                </tr>`;
+              }).join('')}</tbody>
+            </table></div>`
+        }
+      </section>
+    </div>
+  `;
+}
+
+loadDashboard();
+setInterval(loadDashboard, 60000);
+</script>
+</body>
+</html>
