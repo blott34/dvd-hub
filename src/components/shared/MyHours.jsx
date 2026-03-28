@@ -67,21 +67,29 @@ export default function MyHours({ employee }) {
                 <th>In</th>
                 <th>Out</th>
                 <th>Hours</th>
+                <th>Total</th>
               </tr>
             </thead>
             <tbody>
-              {punches.map((p) => (
+              {punches.reduce((acc, p) => {
+                const hrs = parseFloat(p.hours_worked) || 0;
+                const cumulative = (acc.length > 0 ? acc[acc.length - 1].cumulative : 0) + hrs;
+                acc.push({ ...p, cumulative });
+                return acc;
+              }, []).map((p) => (
                 <tr key={p.id}>
                   <td>{formatDate(p.date)}</td>
                   <td>{formatTime(p.time_in)}</td>
                   <td>{formatTime(p.time_out)}</td>
                   <td>{p.hours_worked ? `${parseFloat(p.hours_worked).toFixed(1)}h` : '--'}</td>
+                  <td style={{ fontWeight: 600 }}>{p.cumulative.toFixed(1)}h</td>
                 </tr>
               ))}
             </tbody>
             <tfoot>
               <tr style={{ fontWeight: 700, borderTop: '2px solid var(--border)' }}>
                 <td colSpan={3} style={{ paddingTop: 12 }}>Week Total</td>
+                <td style={{ paddingTop: 12 }}>{weekTotal.toFixed(1)}h</td>
                 <td style={{ paddingTop: 12 }}>{weekTotal.toFixed(1)}h</td>
               </tr>
             </tfoot>

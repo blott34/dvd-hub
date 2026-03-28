@@ -1,9 +1,11 @@
 import { useState } from 'react';
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import LoginScreen from './pages/LoginScreen';
 import ScannerDashboard from './pages/ScannerDashboard';
 import CleanerDashboard from './pages/CleanerDashboard';
+import OwnerDashboard from './pages/OwnerDashboard';
 
-export default function App() {
+function EmployeeApp() {
   const [employee, setEmployee] = useState(null);
 
   if (!employee) {
@@ -17,4 +19,15 @@ export default function App() {
   }
 
   return <CleanerDashboard onLogout={handleLogout} />;
+}
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/owner" element={<OwnerDashboard />} />
+        <Route path="*" element={<EmployeeApp />} />
+      </Routes>
+    </BrowserRouter>
+  );
 }

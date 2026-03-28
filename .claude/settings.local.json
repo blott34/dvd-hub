@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmd.exe /c \"where node\")",
+      "Bash(cmd.exe /c \"where npm\")",
+      "Bash(export PATH=\"$PATH:/c/Program Files/nodejs\")",
+      "Bash(npm -v)",
+      "Read(//c/Program Files/**)",
+      "Read(//c//**)",
+      "Read(//c/Users/bryce/Documents/dvd-hub/$HOME/AppData/Roaming/**)",
+      "Read(//c/Users/bryce/Documents/dvd-hub/$HOME/AppData/Local/**)",
+      "Read(//c/Users/bryce/Documents/dvd-hub/$APPDATA/**)",
+      "Bash(npm create:*)",
+      "Bash(cp -r dvd-hub-app/* dvd-hub-app/.* .)",
+      "Bash(rm -rf dvd-hub-app)",
+      "Bash(npm install:*)",
+      "Bash(npx vite:*)",
+      "Bash(npm run:*)",
+      "Bash(git init:*)",
+      "Bash(gh auth:*)",
+      "Bash(winget install:*)",
+      "Bash(export PATH=\"$PATH:/c/Program Files/GitHub CLI\")",
+      "Read(//c/Program Files \\(x86\\)/**)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" auth status 2>&1)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" auth status)",
+      "Read(//c/Users/bryce/.config/gh/**)",
+      "Read(//c/Users/bryce/Documents/dvd-hub/$APPDATA/GitHub CLI/**)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git config:*)",
+      "Bash(git remote:*)",
+      "Bash(git branch:*)",
+      "Bash(git push:*)",
+      "Bash(grep -E \"\\\\.\\(json|jsx|js|tsx|ts\\)$\")"
+    ]
+  }
+}

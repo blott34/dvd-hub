@@ -70,6 +70,26 @@ export default function LogScan({ onScanLogged }) {
             <div className="stat-label">Fails</div>
           </div>
         </div>
+        <div
+          style={{
+            marginTop: 16,
+            paddingTop: 12,
+            borderTop: '2px solid var(--border)',
+            display: 'flex',
+            justifyContent: 'space-between',
+            fontWeight: 700,
+            fontSize: '0.95rem',
+          }}
+        >
+          <span>Totals</span>
+          <span>
+            <span style={{ color: '#16a34a' }}>{passes} Pass</span>
+            {' / '}
+            <span style={{ color: '#dc2626' }}>{fails} Fail</span>
+            {' / '}
+            <span>{passes + fails} Total</span>
+          </span>
+        </div>
       </div>
     </div>
   );
