@@ -16,6 +16,8 @@
   }
 
   .page-header {
+    display: block;
+    width: 100%;
     text-align: center;
     padding: 20px 20px 16px;
     border-bottom: 1px solid #222;
@@ -37,19 +39,22 @@
 
   .page-meta span { margin: 0 10px; }
 
-  .grid {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 20px;
+  .content {
+    display: block;
+    width: 100%;
     padding: 24px 48px 48px;
+  }
+
+  .content > * { margin-bottom: 20px; }
+  .content > *:last-child { margin-bottom: 0; }
+
+  .row {
+    display: flex;
+    gap: 20px;
     width: 100%;
   }
 
-  .row {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 20px;
-  }
+  .row > .section { flex: 1; min-width: 0; }
 
   .section {
     background: #1a1a1a;
@@ -308,8 +313,8 @@
   }
 
   @media (max-width: 900px) {
-    .grid { padding: 20px; }
-    .row { grid-template-columns: 1fr; }
+    .content { padding: 20px; }
+    .row { flex-direction: column; }
     .stats { grid-template-columns: repeat(3, 1fr); }
     .costs-grid { grid-template-columns: 1fr; }
     .emp-grid { grid-template-columns: 1fr; }
@@ -407,7 +412,7 @@ async function loadDashboard() {
   const [
     todayLogs, ppLogs, shipDoneToday, shipDonePP,
     todayTimesheets, ppTimesheets,
-    batches, shipCosts, supplies, ppSummary,
+    batches, shipCosts, supplies,
   ] = await Promise.all([
     query('daily_log', `select=result&timestamp=gte.${sod}`),
     query('daily_log', `select=result,timestamp&timestamp=gte.${pp.start}T00:00:00&timestamp=lte.${pp.end}T23:59:59`),
@@ -418,7 +423,6 @@ async function loadDashboard() {
     query('shipments_ready', `select=*&order=timestamp.desc&limit=30`),
     query('shipments_completed', `select=date,placement_fee,shipping_fee&date=gte.${pp.start}&date=lte.${pp.end}`),
     query('supply_tracker', `select=*&order=item.asc`),
-    query('daily_summary', `select=*&date=gte.${pp.start}&date=lte.${pp.end}&order=date.desc`),
   ]);
 
   // Daily overview
@@ -480,7 +484,7 @@ async function loadDashboard() {
       </div>
     </div>
 
-    <div class="grid">
+    <div class="content">
       <!-- Daily + Pay Period Overviews side by side -->
       <div class="row">
         <section class="section">
@@ -634,31 +638,6 @@ async function loadDashboard() {
               </span>
             </div>
           `).join('')
-        }
-      </section>
-
-      <!-- Pay Period Summary -->
-      <section class="section">
-        <h2>Pay Period Summary <span class="h2-sub">${ppRange}</span></h2>
-        ${ppSummary.length === 0
-          ? '<div class="empty">No summary data available</div>'
-          : `<div class="table-wrap"><table>
-              <thead><tr>
-                <th>Date</th><th>Total Scans</th><th>Passes</th><th>Fails</th><th>Pass Rate</th><th>Shipments</th>
-              </tr></thead>
-              <tbody>${ppSummary.map(d => {
-                const t = (d.passes || 0) + (d.fails || 0);
-                const r = t > 0 ? Math.round(((d.passes || 0) / t) * 100) : 0;
-                return `<tr>
-                  <td>${fmtDate(d.date)}</td>
-                  <td>${d.total_scans != null ? d.total_scans : t}</td>
-                  <td class="green">${d.passes || 0}</td>
-                  <td class="red">${d.fails || 0}</td>
-                  <td>${d.pass_rate != null ? d.pass_rate : r}%</td>
-                  <td>${d.shipments || 0}</td>
-                </tr>`;
-              }).join('')}</tbody>
-            </table></div>`
         }
       </section>
     </div>
