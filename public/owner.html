@@ -15,32 +15,40 @@
     -webkit-font-smoothing: antialiased;
   }
 
-  .page-title {
+  .page-header {
     text-align: center;
-    padding: 24px 20px 6px;
-    font-size: 15px;
+    padding: 20px 20px 16px;
+    border-bottom: 1px solid #222;
+  }
+
+  .page-header h1 {
+    font-size: 13px;
     font-weight: 600;
-    color: #888;
-    letter-spacing: 1px;
+    color: #666;
+    letter-spacing: 1.5px;
     text-transform: uppercase;
+    margin-bottom: 6px;
   }
 
   .page-meta {
-    text-align: center;
-    padding: 0 20px 20px;
     font-size: 12px;
     color: #555;
-    border-bottom: 1px solid #222;
   }
 
   .page-meta span { margin: 0 10px; }
 
   .grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 24px;
-    padding: 28px 48px 48px;
+    grid-template-columns: 1fr;
+    gap: 20px;
+    padding: 24px 48px 48px;
     width: 100%;
+  }
+
+  .row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
   }
 
   .section {
@@ -49,8 +57,6 @@
     padding: 24px;
     border: 1px solid #2a2a2a;
   }
-
-  .section.wide { grid-column: 1 / -1; }
 
   .section h2 {
     font-size: 14px;
@@ -302,9 +308,11 @@
   }
 
   @media (max-width: 900px) {
-    .grid { grid-template-columns: 1fr; padding: 20px; }
+    .grid { padding: 20px; }
+    .row { grid-template-columns: 1fr; }
     .stats { grid-template-columns: repeat(3, 1fr); }
     .costs-grid { grid-template-columns: 1fr; }
+    .emp-grid { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -325,26 +333,25 @@ async function query(table, params = '') {
   return res.json();
 }
 
-// Pay period: 2-week cycle Mon-Fri, resetting every other Monday.
-// Known anchor: Mon March 23, 2026 is a pay period start.
-const PAY_PERIOD_ANCHOR = new Date('2026-03-23T00:00:00');
-const PAY_PERIOD_DAYS = 14;
+// Pay period: 10 work days, Monday through following Friday (2 calendar weeks).
+// Anchor: Monday March 16, 2026 is a known pay period start.
+// Cycle: 14 calendar days. Start = Monday of cycle. End = start + 11 (Friday of week 2).
+// Advances automatically every other Monday forever.
+const PAY_PERIOD_ANCHOR = new Date('2026-03-16T00:00:00');
 
 function getPayPeriod() {
   const now = new Date();
   now.setHours(0, 0, 0, 0);
   const diffMs = now.getTime() - PAY_PERIOD_ANCHOR.getTime();
   const diffDays = Math.floor(diffMs / 86400000);
-  const cycleDay = ((diffDays % PAY_PERIOD_DAYS) + PAY_PERIOD_DAYS) % PAY_PERIOD_DAYS;
+  const cycleDay = ((diffDays % 14) + 14) % 14;
   const start = new Date(now);
   start.setDate(start.getDate() - cycleDay);
   const end = new Date(start);
-  end.setDate(end.getDate() + PAY_PERIOD_DAYS - 1);
+  end.setDate(end.getDate() + 11); // Monday + 11 = Friday of week 2
   return {
     start: start.toISOString().split('T')[0],
     end: end.toISOString().split('T')[0],
-    startDate: start,
-    endDate: end,
   };
 }
 
@@ -352,7 +359,7 @@ function getWeekStart() {
   const now = new Date();
   now.setHours(0, 0, 0, 0);
   const day = now.getDay();
-  const diff = day === 0 ? 6 : day - 1; // Monday = 0 offset
+  const diff = day === 0 ? 6 : day - 1;
   const mon = new Date(now);
   mon.setDate(mon.getDate() - diff);
   return mon.toISOString().split('T')[0];
@@ -403,7 +410,7 @@ async function loadDashboard() {
     batches, shipCosts, supplies, ppSummary,
   ] = await Promise.all([
     query('daily_log', `select=result&timestamp=gte.${sod}`),
-    query('daily_log', `select=result,timestamp&timestamp=gte.${pp.start}T00:00:00`),
+    query('daily_log', `select=result,timestamp&timestamp=gte.${pp.start}T00:00:00&timestamp=lte.${pp.end}T23:59:59`),
     query('shipments_completed', `select=id&date=eq.${today}`),
     query('shipments_completed', `select=id&date=gte.${pp.start}&date=lte.${pp.end}`),
     query('timesheet', `select=*&date=eq.${today}&order=time_in.asc`),
@@ -464,70 +471,73 @@ async function loadDashboard() {
   const ppRange = fmtDateRange(pp.start, pp.end);
 
   document.getElementById('app').innerHTML = `
-    <div class="page-title">DVD Hub — Owner Dashboard</div>
-    <div class="page-meta">
-      <span>${esc(dateStr)}</span>
-      <span>Pay Period: ${ppRange}</span>
-      <span>Auto-refreshes every 60s</span>
+    <div class="page-header">
+      <h1>DVD Hub — Owner Dashboard</h1>
+      <div class="page-meta">
+        <span>${esc(dateStr)}</span>
+        <span>Pay Period: ${ppRange}</span>
+        <span>Auto-refreshes every 60s</span>
+      </div>
     </div>
 
     <div class="grid">
-      <!-- Daily Overview -->
-      <section class="section">
-        <h2>Daily Overview <span class="h2-sub">Today</span></h2>
-        <div class="stats">
-          <div class="stat">
-            <div class="stat-val">${total}</div>
-            <div class="stat-lbl">Total Scans</div>
+      <!-- Daily + Pay Period Overviews side by side -->
+      <div class="row">
+        <section class="section">
+          <h2>Daily Overview <span class="h2-sub">Today</span></h2>
+          <div class="stats">
+            <div class="stat">
+              <div class="stat-val">${total}</div>
+              <div class="stat-lbl">Total Scans</div>
+            </div>
+            <div class="stat">
+              <div class="stat-val green">${passed}</div>
+              <div class="stat-lbl">Passes</div>
+            </div>
+            <div class="stat">
+              <div class="stat-val red">${failed}</div>
+              <div class="stat-lbl">Fails</div>
+            </div>
+            <div class="stat">
+              <div class="stat-val">${passRate}%</div>
+              <div class="stat-lbl">Pass Rate</div>
+            </div>
+            <div class="stat">
+              <div class="stat-val blue">${shipCount}</div>
+              <div class="stat-lbl">Shipments</div>
+            </div>
           </div>
-          <div class="stat">
-            <div class="stat-val green">${passed}</div>
-            <div class="stat-lbl">Passes</div>
-          </div>
-          <div class="stat">
-            <div class="stat-val red">${failed}</div>
-            <div class="stat-lbl">Fails</div>
-          </div>
-          <div class="stat">
-            <div class="stat-val">${passRate}%</div>
-            <div class="stat-lbl">Pass Rate</div>
-          </div>
-          <div class="stat">
-            <div class="stat-val blue">${shipCount}</div>
-            <div class="stat-lbl">Shipments</div>
-          </div>
-        </div>
-      </section>
+        </section>
 
-      <!-- Pay Period Overview -->
-      <section class="section">
-        <h2>Pay Period Overview <span class="h2-sub">${ppRange}</span></h2>
-        <div class="stats">
-          <div class="stat">
-            <div class="stat-val">${ppTotal}</div>
-            <div class="stat-lbl">Total Scans</div>
+        <section class="section">
+          <h2>Pay Period Overview <span class="h2-sub">${ppRange}</span></h2>
+          <div class="stats">
+            <div class="stat">
+              <div class="stat-val">${ppTotal}</div>
+              <div class="stat-lbl">Total Scans</div>
+            </div>
+            <div class="stat">
+              <div class="stat-val green">${ppPassed}</div>
+              <div class="stat-lbl">Passes</div>
+            </div>
+            <div class="stat">
+              <div class="stat-val red">${ppFailed}</div>
+              <div class="stat-lbl">Fails</div>
+            </div>
+            <div class="stat">
+              <div class="stat-val">${ppRate}%</div>
+              <div class="stat-lbl">Pass Rate</div>
+            </div>
+            <div class="stat">
+              <div class="stat-val blue">${ppShipCount}</div>
+              <div class="stat-lbl">Shipments</div>
+            </div>
           </div>
-          <div class="stat">
-            <div class="stat-val green">${ppPassed}</div>
-            <div class="stat-lbl">Passes</div>
-          </div>
-          <div class="stat">
-            <div class="stat-val red">${ppFailed}</div>
-            <div class="stat-lbl">Fails</div>
-          </div>
-          <div class="stat">
-            <div class="stat-val">${ppRate}%</div>
-            <div class="stat-lbl">Pass Rate</div>
-          </div>
-          <div class="stat">
-            <div class="stat-val blue">${ppShipCount}</div>
-            <div class="stat-lbl">Shipments</div>
-          </div>
-        </div>
-      </section>
+        </section>
+      </div>
 
       <!-- Employee Status -->
-      <section class="section wide">
+      <section class="section">
         <h2>Employee Status</h2>
         <div class="emp-grid">
           ${['Scanner', 'Cleaner'].map((emp, i) => `
@@ -560,7 +570,7 @@ async function loadDashboard() {
       </section>
 
       <!-- Shipments Pipeline -->
-      <section class="section wide">
+      <section class="section">
         <h2>Shipments Pipeline</h2>
         ${batches.length === 0
           ? '<div class="empty">No batches in pipeline</div>'
@@ -587,7 +597,7 @@ async function loadDashboard() {
       </section>
 
       <!-- Shipment Costs -->
-      <section class="section wide">
+      <section class="section">
         <h2>Shipment Costs</h2>
         <div class="costs-grid">
           <div class="cost-block">
@@ -612,7 +622,7 @@ async function loadDashboard() {
       </section>
 
       <!-- Supply Alerts -->
-      <section class="section wide">
+      <section class="section">
         <h2>Supply Alerts</h2>
         ${alerts.length === 0
           ? '<div class="empty ok">All supplies above trigger levels</div>'
@@ -628,7 +638,7 @@ async function loadDashboard() {
       </section>
 
       <!-- Pay Period Summary -->
-      <section class="section wide">
+      <section class="section">
         <h2>Pay Period Summary <span class="h2-sub">${ppRange}</span></h2>
         ${ppSummary.length === 0
           ? '<div class="empty">No summary data available</div>'
