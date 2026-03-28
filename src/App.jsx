@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { createBrowserRouter, RouterProvider } from 'react-router-dom';
 import LoginScreen from './pages/LoginScreen';
 import ScannerDashboard from './pages/ScannerDashboard';
 import CleanerDashboard from './pages/CleanerDashboard';
@@ -21,13 +21,11 @@ function EmployeeApp() {
   return <CleanerDashboard onLogout={handleLogout} />;
 }
 
+const router = createBrowserRouter([
+  { path: '/owner', element: <OwnerDashboard /> },
+  { path: '*', element: <EmployeeApp /> },
+]);
+
 export default function App() {
-  return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="/owner" element={<OwnerDashboard />} />
-        <Route path="*" element={<EmployeeApp />} />
-      </Routes>
-    </BrowserRouter>
-  );
+  return <RouterProvider router={router} />;
 }

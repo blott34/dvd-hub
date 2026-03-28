@@ -31,7 +31,9 @@
       "Bash(git remote:*)",
       "Bash(git branch:*)",
       "Bash(git push:*)",
-      "Bash(grep -E \"\\\\.\\(json|jsx|js|tsx|ts\\)$\")"
+      "Bash(grep -E \"\\\\.\\(json|jsx|js|tsx|ts\\)$\")",
+      "Bash(node:*)",
+      "Bash(grep -o \"owner\" dist/assets/index-*.js)"
     ]
   }
 }
