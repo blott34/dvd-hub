@@ -15,37 +15,32 @@
     -webkit-font-smoothing: antialiased;
   }
 
-  header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    padding: 28px 40px 20px;
+  .page-title {
+    text-align: center;
+    padding: 24px 20px 6px;
+    font-size: 15px;
+    font-weight: 600;
+    color: #888;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+
+  .page-meta {
+    text-align: center;
+    padding: 0 20px 20px;
+    font-size: 12px;
+    color: #555;
     border-bottom: 1px solid #222;
   }
 
-  header h1 { font-size: 24px; font-weight: 700; color: #ffffff; }
-
-  .header-right {
-    display: flex;
-    align-items: baseline;
-    gap: 20px;
-  }
-
-  .header-date { font-size: 14px; color: #888; }
-
-  .refresh-note {
-    font-size: 11px;
-    color: #555;
-    letter-spacing: 0.3px;
-  }
+  .page-meta span { margin: 0 10px; }
 
   .grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 24px;
-    padding: 28px 40px 48px;
+    padding: 28px 48px 48px;
     width: 100%;
-    margin: 0 auto;
   }
 
   .section {
@@ -64,6 +59,15 @@
     color: #ffffff;
     margin-bottom: 18px;
     font-weight: 600;
+  }
+
+  .section h2 .h2-sub {
+    font-weight: 400;
+    color: #666;
+    text-transform: none;
+    letter-spacing: 0;
+    margin-left: 8px;
+    font-size: 12px;
   }
 
   /* Stats row */
@@ -133,7 +137,7 @@
     align-items: center;
     gap: 8px;
     font-size: 14px;
-    margin-bottom: 6px;
+    margin-bottom: 12px;
   }
 
   .dot {
@@ -146,11 +150,32 @@
   .dot.in  { background: #22ff55; box-shadow: 0 0 8px #22ff5580; }
   .dot.out { background: #555; }
 
-  .emp-hours {
-    font-size: 20px;
+  .emp-hours-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .emp-h-block {
+    text-align: center;
+    background: #1a1a1a;
+    border-radius: 6px;
+    padding: 10px 4px;
+  }
+
+  .emp-h-val {
+    font-size: 18px;
     font-weight: 700;
     color: #ffffff;
-    margin-top: 8px;
+  }
+
+  .emp-h-lbl {
+    font-size: 10px;
+    color: #888;
+    margin-top: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
   }
 
   /* Tables */
@@ -195,7 +220,7 @@
   /* Costs */
   .costs-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr 1fr 1fr;
     gap: 16px;
   }
 
@@ -279,11 +304,7 @@
   @media (max-width: 900px) {
     .grid { grid-template-columns: 1fr; padding: 20px; }
     .stats { grid-template-columns: repeat(3, 1fr); }
-    header { padding: 20px; flex-direction: column; gap: 4px; }
-  }
-
-  @media (min-width: 901px) {
-    .grid { padding: 28px 48px 48px; }
+    .costs-grid { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -304,14 +325,41 @@ async function query(table, params = '') {
   return res.json();
 }
 
-function todayISO() {
-  return new Date().toISOString().split('T')[0];
+// Pay period: 2-week cycle Mon-Fri, resetting every other Monday.
+// Known anchor: Mon March 23, 2026 is a pay period start.
+const PAY_PERIOD_ANCHOR = new Date('2026-03-23T00:00:00');
+const PAY_PERIOD_DAYS = 14;
+
+function getPayPeriod() {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const diffMs = now.getTime() - PAY_PERIOD_ANCHOR.getTime();
+  const diffDays = Math.floor(diffMs / 86400000);
+  const cycleDay = ((diffDays % PAY_PERIOD_DAYS) + PAY_PERIOD_DAYS) % PAY_PERIOD_DAYS;
+  const start = new Date(now);
+  start.setDate(start.getDate() - cycleDay);
+  const end = new Date(start);
+  end.setDate(end.getDate() + PAY_PERIOD_DAYS - 1);
+  return {
+    start: start.toISOString().split('T')[0],
+    end: end.toISOString().split('T')[0],
+    startDate: start,
+    endDate: end,
+  };
 }
 
-function weekAgoISO() {
-  const d = new Date();
-  d.setDate(d.getDate() - 7);
-  return d.toISOString().split('T')[0];
+function getWeekStart() {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const day = now.getDay();
+  const diff = day === 0 ? 6 : day - 1; // Monday = 0 offset
+  const mon = new Date(now);
+  mon.setDate(mon.getDate() - diff);
+  return mon.toISOString().split('T')[0];
+}
+
+function todayISO() {
+  return new Date().toISOString().split('T')[0];
 }
 
 function startOfDayISO() {
@@ -326,6 +374,13 @@ function fmtDate(d) {
   });
 }
 
+function fmtDateRange(start, end) {
+  const s = new Date(start + 'T00:00:00');
+  const e = new Date(end + 'T00:00:00');
+  const opts = { month: 'short', day: 'numeric' };
+  return s.toLocaleDateString('en-US', opts) + ' — ' + e.toLocaleDateString('en-US', opts);
+}
+
 function fmtShortDate(ts) {
   return new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
@@ -338,43 +393,65 @@ function esc(s) {
 
 async function loadDashboard() {
   const today = todayISO();
-  const weekAgo = weekAgoISO();
   const sod = startOfDayISO();
+  const pp = getPayPeriod();
+  const weekStart = getWeekStart();
 
-  const [logs, shipDone, timesheets, batches, shipCosts, supplies, weekly] = await Promise.all([
+  const [
+    todayLogs, ppLogs, shipDoneToday, shipDonePP,
+    todayTimesheets, ppTimesheets,
+    batches, shipCosts, supplies, ppSummary,
+  ] = await Promise.all([
     query('daily_log', `select=result&timestamp=gte.${sod}`),
+    query('daily_log', `select=result,timestamp&timestamp=gte.${pp.start}T00:00:00`),
     query('shipments_completed', `select=id&date=eq.${today}`),
+    query('shipments_completed', `select=id&date=gte.${pp.start}&date=lte.${pp.end}`),
     query('timesheet', `select=*&date=eq.${today}&order=time_in.asc`),
+    query('timesheet', `select=*&date=gte.${pp.start}&date=lte.${pp.end}&order=time_in.asc`),
     query('shipments_ready', `select=*&order=timestamp.desc&limit=30`),
-    query('shipments_completed', `select=date,placement_fee,shipping_fee&date=gte.${weekAgo}`),
+    query('shipments_completed', `select=date,placement_fee,shipping_fee&date=gte.${pp.start}&date=lte.${pp.end}`),
     query('supply_tracker', `select=*&order=item.asc`),
-    query('daily_summary', `select=*&date=gte.${weekAgo}&order=date.desc`),
+    query('daily_summary', `select=*&date=gte.${pp.start}&date=lte.${pp.end}&order=date.desc`),
   ]);
 
   // Daily overview
-  const passed = logs.filter(r => r.result === 'Pass').length;
-  const failed = logs.filter(r => r.result === 'Fail').length;
-  const total = logs.length;
+  const passed = todayLogs.filter(r => r.result === 'Pass').length;
+  const failed = todayLogs.filter(r => r.result === 'Fail').length;
+  const total = todayLogs.length;
   const passRate = total > 0 ? Math.round((passed / total) * 100) : 0;
-  const shipCount = shipDone.length;
+  const shipCount = shipDoneToday.length;
+
+  // Pay period overview
+  const ppPassed = ppLogs.filter(r => r.result === 'Pass').length;
+  const ppFailed = ppLogs.filter(r => r.result === 'Fail').length;
+  const ppTotal = ppLogs.length;
+  const ppRate = ppTotal > 0 ? Math.round((ppPassed / ppTotal) * 100) : 0;
+  const ppShipCount = shipDonePP.length;
 
   // Employee status
   const employees = {};
   for (const emp of ['Scanner', 'Cleaner']) {
-    const rows = timesheets.filter(r => r.employee === emp);
-    const hours = rows.reduce((s, r) => s + (parseFloat(r.hours_worked) || 0), 0);
-    const last = rows[rows.length - 1];
+    const todayRows = todayTimesheets.filter(r => r.employee === emp);
+    const ppRows = ppTimesheets.filter(r => r.employee === emp);
+    const weekRows = ppRows.filter(r => r.date >= weekStart);
+    const hoursToday = todayRows.reduce((s, r) => s + (parseFloat(r.hours_worked) || 0), 0);
+    const hoursWeek = weekRows.reduce((s, r) => s + (parseFloat(r.hours_worked) || 0), 0);
+    const hoursPP = ppRows.reduce((s, r) => s + (parseFloat(r.hours_worked) || 0), 0);
+    const last = todayRows[todayRows.length - 1];
     const clockedIn = last ? (last.time_in && !last.time_out) : false;
-    employees[emp] = { clockedIn, hours };
+    employees[emp] = { clockedIn, hoursToday, hoursWeek, hoursPP };
   }
 
-  // Costs
+  // Costs - today, this week, pay period
   const todayCosts = shipCosts.filter(r => r.date === today);
+  const weekCosts = shipCosts.filter(r => r.date >= weekStart);
   const costData = {
     tp: todayCosts.reduce((s, r) => s + (parseFloat(r.placement_fee) || 0), 0),
     ts: todayCosts.reduce((s, r) => s + (parseFloat(r.shipping_fee) || 0), 0),
-    wp: shipCosts.reduce((s, r) => s + (parseFloat(r.placement_fee) || 0), 0),
-    ws: shipCosts.reduce((s, r) => s + (parseFloat(r.shipping_fee) || 0), 0),
+    wp: weekCosts.reduce((s, r) => s + (parseFloat(r.placement_fee) || 0), 0),
+    ws: weekCosts.reduce((s, r) => s + (parseFloat(r.shipping_fee) || 0), 0),
+    pp: shipCosts.reduce((s, r) => s + (parseFloat(r.placement_fee) || 0), 0),
+    ps: shipCosts.reduce((s, r) => s + (parseFloat(r.shipping_fee) || 0), 0),
   };
 
   // Supply alerts
@@ -384,20 +461,20 @@ async function loadDashboard() {
   const dateStr = new Date().toLocaleDateString('en-US', {
     weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
   });
+  const ppRange = fmtDateRange(pp.start, pp.end);
 
   document.getElementById('app').innerHTML = `
-    <header>
-      <h1>DVD Hub — Owner Dashboard</h1>
-      <div class="header-right">
-        <span class="header-date">${esc(dateStr)}</span>
-        <span class="refresh-note">Auto-refreshes every 60s</span>
-      </div>
-    </header>
+    <div class="page-title">DVD Hub — Owner Dashboard</div>
+    <div class="page-meta">
+      <span>${esc(dateStr)}</span>
+      <span>Pay Period: ${ppRange}</span>
+      <span>Auto-refreshes every 60s</span>
+    </div>
 
     <div class="grid">
       <!-- Daily Overview -->
       <section class="section">
-        <h2>Daily Overview</h2>
+        <h2>Daily Overview <span class="h2-sub">Today</span></h2>
         <div class="stats">
           <div class="stat">
             <div class="stat-val">${total}</div>
@@ -422,8 +499,35 @@ async function loadDashboard() {
         </div>
       </section>
 
-      <!-- Employee Status -->
+      <!-- Pay Period Overview -->
       <section class="section">
+        <h2>Pay Period Overview <span class="h2-sub">${ppRange}</span></h2>
+        <div class="stats">
+          <div class="stat">
+            <div class="stat-val">${ppTotal}</div>
+            <div class="stat-lbl">Total Scans</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val green">${ppPassed}</div>
+            <div class="stat-lbl">Passes</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val red">${ppFailed}</div>
+            <div class="stat-lbl">Fails</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val">${ppRate}%</div>
+            <div class="stat-lbl">Pass Rate</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val blue">${ppShipCount}</div>
+            <div class="stat-lbl">Shipments</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Employee Status -->
+      <section class="section wide">
         <h2>Employee Status</h2>
         <div class="emp-grid">
           ${['Scanner', 'Cleaner'].map((emp, i) => `
@@ -436,7 +540,20 @@ async function loadDashboard() {
                 <span class="dot ${employees[emp].clockedIn ? 'in' : 'out'}"></span>
                 <span>${employees[emp].clockedIn ? 'Clocked In' : 'Clocked Out'}</span>
               </div>
-              <div class="emp-hours">${employees[emp].hours.toFixed(1)}h today</div>
+              <div class="emp-hours-grid">
+                <div class="emp-h-block">
+                  <div class="emp-h-val">${employees[emp].hoursToday.toFixed(1)}h</div>
+                  <div class="emp-h-lbl">Today</div>
+                </div>
+                <div class="emp-h-block">
+                  <div class="emp-h-val">${employees[emp].hoursWeek.toFixed(1)}h</div>
+                  <div class="emp-h-lbl">This Week</div>
+                </div>
+                <div class="emp-h-block">
+                  <div class="emp-h-val">${employees[emp].hoursPP.toFixed(1)}h</div>
+                  <div class="emp-h-lbl">Pay Period</div>
+                </div>
+              </div>
             </div>
           `).join('')}
         </div>
@@ -470,7 +587,7 @@ async function loadDashboard() {
       </section>
 
       <!-- Shipment Costs -->
-      <section class="section">
+      <section class="section wide">
         <h2>Shipment Costs</h2>
         <div class="costs-grid">
           <div class="cost-block">
@@ -485,11 +602,17 @@ async function loadDashboard() {
             <div class="cost-row"><span>Shipping Fees</span><span>$${costData.ws.toFixed(2)}</span></div>
             <div class="cost-row total"><span>Total</span><span>$${(costData.wp + costData.ws).toFixed(2)}</span></div>
           </div>
+          <div class="cost-block">
+            <h4>Pay Period</h4>
+            <div class="cost-row"><span>Placement Fees</span><span>$${costData.pp.toFixed(2)}</span></div>
+            <div class="cost-row"><span>Shipping Fees</span><span>$${costData.ps.toFixed(2)}</span></div>
+            <div class="cost-row total"><span>Total</span><span>$${(costData.pp + costData.ps).toFixed(2)}</span></div>
+          </div>
         </div>
       </section>
 
       <!-- Supply Alerts -->
-      <section class="section">
+      <section class="section wide">
         <h2>Supply Alerts</h2>
         ${alerts.length === 0
           ? '<div class="empty ok">All supplies above trigger levels</div>'
@@ -504,16 +627,16 @@ async function loadDashboard() {
         }
       </section>
 
-      <!-- Weekly Summary -->
+      <!-- Pay Period Summary -->
       <section class="section wide">
-        <h2>Weekly Summary</h2>
-        ${weekly.length === 0
+        <h2>Pay Period Summary <span class="h2-sub">${ppRange}</span></h2>
+        ${ppSummary.length === 0
           ? '<div class="empty">No summary data available</div>'
           : `<div class="table-wrap"><table>
               <thead><tr>
                 <th>Date</th><th>Total Scans</th><th>Passes</th><th>Fails</th><th>Pass Rate</th><th>Shipments</th>
               </tr></thead>
-              <tbody>${weekly.map(d => {
+              <tbody>${ppSummary.map(d => {
                 const t = (d.passes || 0) + (d.fails || 0);
                 const r = t > 0 ? Math.round(((d.passes || 0) / t) * 100) : 0;
                 return `<tr>
