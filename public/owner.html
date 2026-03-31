@@ -314,6 +314,228 @@
 
   .empty.ok { color: #22ff55; }
 
+  /* ===== REPRICER SECTION ===== */
+  .repricer-nav {
+    display: flex;
+    gap: 0;
+    border-bottom: 2px solid #333;
+    margin-bottom: 20px;
+  }
+
+  .repricer-nav button {
+    flex: 1;
+    padding: 12px 16px;
+    background: none;
+    border: none;
+    color: #888;
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+    transition: color 0.2s, border-color 0.2s;
+  }
+
+  .repricer-nav button.active {
+    color: #44aaff;
+    border-bottom-color: #44aaff;
+  }
+
+  .repricer-nav button:hover:not(.active) {
+    color: #ccc;
+  }
+
+  .repricer-tab { display: none; }
+  .repricer-tab.active { display: block; }
+
+  .repricer-summary {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+
+  .repricer-summary .stat {
+    background: #111111;
+    border-radius: 8px;
+    padding: 16px;
+    text-align: center;
+  }
+
+  .repricer-actions {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+
+  .btn-reprice {
+    padding: 10px 24px;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.2s;
+  }
+
+  .btn-reprice:hover { opacity: 0.85; }
+
+  .btn-reprice.primary {
+    background: #44aaff;
+    color: #000;
+  }
+
+  .btn-reprice.secondary {
+    background: #333;
+    color: #ccc;
+  }
+
+  .btn-reprice:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  /* Rules panel */
+  .rules-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .rule-card {
+    background: #111111;
+    border-radius: 8px;
+    padding: 16px 20px;
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+  }
+
+  .rule-toggle {
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+
+  .toggle-switch {
+    position: relative;
+    width: 44px;
+    height: 24px;
+  }
+
+  .toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+
+  .toggle-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: #333;
+    border-radius: 24px;
+    transition: 0.2s;
+  }
+
+  .toggle-slider:before {
+    content: "";
+    position: absolute;
+    height: 18px;
+    width: 18px;
+    left: 3px;
+    bottom: 3px;
+    background: #888;
+    border-radius: 50%;
+    transition: 0.2s;
+  }
+
+  .toggle-switch input:checked + .toggle-slider {
+    background: #22ff55;
+  }
+
+  .toggle-switch input:checked + .toggle-slider:before {
+    transform: translateX(20px);
+    background: #fff;
+  }
+
+  .rule-info { flex: 1; }
+  .rule-name { font-weight: 600; font-size: 15px; color: #fff; margin-bottom: 4px; }
+  .rule-desc { font-size: 13px; color: #888; margin-bottom: 8px; }
+
+  .rule-fields {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .rule-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .rule-field label {
+    font-size: 11px;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  .rule-field input {
+    width: 100px;
+    padding: 6px 10px;
+    background: #1a1a1a;
+    border: 1px solid #333;
+    border-radius: 6px;
+    color: #e2e8f0;
+    font-size: 14px;
+  }
+
+  .rule-field input:focus {
+    outline: none;
+    border-color: #44aaff;
+  }
+
+  /* Log table */
+  .log-reason {
+    font-size: 12px;
+    color: #888;
+    max-width: 360px;
+  }
+
+  .price-up { color: #22ff55; }
+  .price-down { color: #ff4444; }
+
+  .repricer-status {
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 16px;
+    display: none;
+  }
+
+  .repricer-status.success {
+    display: block;
+    background: #0a2a0a;
+    color: #22ff55;
+    border: 1px solid #1a4a1a;
+  }
+
+  .repricer-status.info {
+    display: block;
+    background: #0a1a2a;
+    color: #44aaff;
+    border: 1px solid #1a3a5a;
+  }
+
+  @media (max-width: 900px) {
+    .repricer-summary { grid-template-columns: repeat(2, 1fr); }
+    .rule-card { flex-direction: column; }
+  }
+
   .loading-screen {
     display: flex;
     align-items: center;
@@ -413,6 +635,331 @@ function esc(s) {
   const el = document.createElement('span');
   el.textContent = s;
   return el.innerHTML;
+}
+
+// ===== REPRICER: Mock Data & Engine =====
+const MOCK_LISTINGS = [
+  { asin: 'B00005JNOG', sku: 'DVD-001', title: 'The Shawshank Redemption (1994)', current_price: 12.99, min_price: 8.50, max_price: 24.99, cost_basis: 3.50, sales_rank: 45000, date_listed: '2026-02-15', last_sold: '2026-03-20T14:30:00Z', last_repriced: null, status: 'active' },
+  { asin: 'B00003CXCT', sku: 'DVD-002', title: 'The Godfather (1972)', current_price: 24.99, min_price: 8.50, max_price: 24.99, cost_basis: 4.00, sales_rank: 32000, date_listed: '2026-03-31', last_sold: null, last_repriced: null, status: 'active' },
+  { asin: 'B00005JMF8', sku: 'DVD-003', title: 'Pulp Fiction (1994)', current_price: 8.50, min_price: 8.50, max_price: 24.99, cost_basis: 2.75, sales_rank: 78000, date_listed: '2026-01-10', last_sold: '2026-02-05T09:15:00Z', last_repriced: '2026-03-01T12:00:00Z', status: 'active' },
+  { asin: 'B000P0J0AQ', sku: 'DVD-004', title: 'The Dark Knight (2008)', current_price: 15.49, min_price: 8.50, max_price: 24.99, cost_basis: 5.00, sales_rank: 120000, date_listed: '2026-03-01', last_sold: null, last_repriced: null, status: 'active' },
+  { asin: 'B001AQO3QA', sku: 'DVD-005', title: 'Forrest Gump (1994)', current_price: 10.99, min_price: 8.50, max_price: 24.99, cost_basis: 3.00, sales_rank: 650000, date_listed: '2026-02-01', last_sold: null, last_repriced: '2026-03-15T08:00:00Z', status: 'active' },
+  { asin: 'B00AEFYIKQ', sku: 'DVD-006', title: 'Inception (2010)', current_price: 18.75, min_price: 8.50, max_price: 24.99, cost_basis: 4.50, sales_rank: 95000, date_listed: '2026-03-10', last_sold: '2026-03-25T16:45:00Z', last_repriced: null, status: 'active' },
+  { asin: 'B003EYIZ1G', sku: 'DVD-007', title: 'The Matrix (1999)', current_price: 9.25, min_price: 8.50, max_price: 24.99, cost_basis: 8.00, sales_rank: 210000, date_listed: '2026-01-20', last_sold: '2026-02-28T11:00:00Z', last_repriced: '2026-03-10T10:30:00Z', status: 'active' },
+  { asin: 'B00G4RKQ0M', sku: 'DVD-008', title: 'Interstellar (2014)', current_price: 22.00, min_price: 8.50, max_price: 24.99, cost_basis: 6.00, sales_rank: 55000, date_listed: '2026-03-20', last_sold: null, last_repriced: null, status: 'active' },
+  { asin: 'B005LAIINI', sku: 'DVD-009', title: 'Goodfellas (1990)', current_price: 14.00, min_price: 8.50, max_price: 24.99, cost_basis: 3.25, sales_rank: 180000, date_listed: '2026-02-10', last_sold: null, last_repriced: null, status: 'active' },
+  { asin: 'B00K19SD8Q', sku: 'DVD-010', title: 'Guardians of the Galaxy (2014)', current_price: 11.50, min_price: 8.50, max_price: 24.99, cost_basis: 4.25, sales_rank: 88000, date_listed: '2026-03-05', last_sold: '2026-03-28T13:20:00Z', last_repriced: '2026-03-25T09:00:00Z', status: 'active' },
+];
+
+let repricerListings = JSON.parse(JSON.stringify(MOCK_LISTINGS));
+let repricerLog = [];
+
+const REPRICER_RULES = [
+  { id: 1, rule_name: 'Default Floors', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: null, notes: 'Min $8.50, Max $24.99 for all listings unless overridden' },
+  { id: 2, rule_name: 'Max Hit Day 1', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: 3.00, target_position: null, notes: 'If listing hits max price on day 1, raise max by configured amount' },
+  { id: 3, rule_name: 'Stale Inventory', is_active: true, days_before_drop: 30, drop_amount: 0.50, max_hit_raise_amount: null, target_position: null, notes: 'Drop min price after configured days without a sale' },
+  { id: 4, rule_name: 'Never Below Cost', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: null, notes: 'No rule can drop price below cost_basis' },
+  { id: 5, rule_name: 'Sales Rank Guard', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: 500000, notes: 'Do not reprice downward if sales rank above threshold' },
+];
+
+function runRepricerEngine() {
+  const now = new Date();
+  const newLogEntries = [];
+
+  for (const listing of repricerListings) {
+    if (listing.status !== 'active') continue;
+
+    let newPrice = listing.current_price;
+    let reason = null;
+
+    // Rule 1: Default Floors
+    const r1 = REPRICER_RULES.find(r => r.rule_name === 'Default Floors');
+    if (r1 && r1.is_active) {
+      if (newPrice < listing.min_price) {
+        newPrice = listing.min_price;
+        reason = 'Default Floors: price below minimum, raised to min';
+      }
+      if (newPrice > listing.max_price) {
+        newPrice = listing.max_price;
+        reason = 'Default Floors: price above maximum, lowered to max';
+      }
+    }
+
+    // Rule 2: Max Hit Day 1
+    const r2 = REPRICER_RULES.find(r => r.rule_name === 'Max Hit Day 1');
+    if (r2 && r2.is_active) {
+      const dateListed = new Date(listing.date_listed + 'T00:00:00');
+      const daysSinceListed = Math.floor((now - dateListed) / 86400000);
+      const raiseAmount = parseFloat(r2.max_hit_raise_amount) || 3.00;
+      if (daysSinceListed <= 1 && listing.current_price >= listing.max_price) {
+        listing.max_price = parseFloat((listing.max_price + raiseAmount).toFixed(2));
+        reason = 'Max Hit Day 1: hit max on day 1, raised max to $' + listing.max_price.toFixed(2) + ' (+$' + raiseAmount.toFixed(2) + ')';
+      }
+    }
+
+    // Rule 3: Stale Inventory
+    const r3 = REPRICER_RULES.find(r => r.rule_name === 'Stale Inventory');
+    if (r3 && r3.is_active) {
+      const daysBefore = parseInt(r3.days_before_drop) || 30;
+      const dropAmount = parseFloat(r3.drop_amount) || 0.50;
+      const dateListed = new Date(listing.date_listed + 'T00:00:00');
+      const daysActive = Math.floor((now - dateListed) / 86400000);
+      const lastSold = listing.last_sold ? new Date(listing.last_sold) : null;
+      const daysSinceSale = lastSold ? Math.floor((now - lastSold) / 86400000) : daysActive;
+      if (daysSinceSale >= daysBefore) {
+        const droppedPrice = parseFloat((newPrice - dropAmount).toFixed(2));
+        if (droppedPrice < newPrice) {
+          newPrice = droppedPrice;
+          reason = 'Stale Inventory: ' + daysSinceSale + ' days without sale, dropped $' + dropAmount.toFixed(2);
+        }
+      }
+    }
+
+    // Rule 4: Never Below Cost
+    const r4 = REPRICER_RULES.find(r => r.rule_name === 'Never Below Cost');
+    if (r4 && r4.is_active) {
+      if (newPrice < listing.cost_basis) {
+        newPrice = listing.cost_basis;
+        reason = 'Never Below Cost: price floored at cost basis $' + listing.cost_basis.toFixed(2);
+      }
+    }
+
+    // Rule 5: Sales Rank Guard
+    const r5 = REPRICER_RULES.find(r => r.rule_name === 'Sales Rank Guard');
+    if (r5 && r5.is_active) {
+      const threshold = parseInt(r5.target_position) || 500000;
+      if (listing.sales_rank > threshold && newPrice < listing.current_price) {
+        newPrice = listing.current_price;
+        reason = 'Sales Rank Guard: rank ' + listing.sales_rank.toLocaleString() + ' above ' + threshold.toLocaleString() + ', blocked downward reprice';
+      }
+    }
+
+    // Final bounds
+    newPrice = Math.max(newPrice, listing.min_price);
+    newPrice = Math.min(newPrice, listing.max_price);
+    newPrice = parseFloat(newPrice.toFixed(2));
+
+    if (newPrice !== listing.current_price) {
+      newLogEntries.push({
+        asin: listing.asin,
+        sku: listing.sku,
+        old_price: listing.current_price,
+        new_price: newPrice,
+        reason: reason || 'Price adjusted within bounds',
+        timestamp: now.toISOString(),
+      });
+      listing.current_price = newPrice;
+      listing.last_repriced = now.toISOString();
+    }
+  }
+
+  repricerLog = newLogEntries.concat(repricerLog).slice(0, 50);
+  return newLogEntries;
+}
+
+function renderRepricer() {
+  const now = new Date();
+  const active = repricerListings.filter(l => l.status === 'active');
+  const avgPrice = active.length > 0
+    ? (active.reduce((s, l) => s + l.current_price, 0) / active.length).toFixed(2)
+    : '0.00';
+  const atMin = active.filter(l => l.current_price <= l.min_price).length;
+  const atMax = active.filter(l => l.current_price >= l.max_price).length;
+
+  return `
+    <section class="section" id="repricer-section">
+      <h2>Repricer</h2>
+      <div class="repricer-nav">
+        <button class="active" onclick="switchRepricerTab('overview')">Overview</button>
+        <button onclick="switchRepricerTab('listings')">Listings</button>
+        <button onclick="switchRepricerTab('rules')">Rules</button>
+        <button onclick="switchRepricerTab('log')">Log</button>
+      </div>
+
+      <!-- OVERVIEW TAB -->
+      <div class="repricer-tab active" id="repricer-overview">
+        <div class="repricer-summary">
+          <div class="stat">
+            <div class="stat-val blue">${active.length}</div>
+            <div class="stat-lbl">Active Listings</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val">$${avgPrice}</div>
+            <div class="stat-lbl">Avg Price</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val red">${atMin}</div>
+            <div class="stat-lbl">At Min Price</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val green">${atMax}</div>
+            <div class="stat-lbl">At Max Price</div>
+          </div>
+        </div>
+        <div class="repricer-actions">
+          <button class="btn-reprice primary" onclick="handleRunRepricer()">Run Repricing Engine</button>
+          <button class="btn-reprice secondary" onclick="handleResetRepricer()">Reset Mock Data</button>
+        </div>
+        <div class="repricer-status" id="repricer-status"></div>
+        <!-- Quick log preview -->
+        ${repricerLog.length > 0 ? `
+          <h3 style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;margin-top:8px;">Recent Changes</h3>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Time</th><th>SKU</th><th>Old</th><th>New</th><th>Reason</th></tr></thead>
+            <tbody>${repricerLog.slice(0, 5).map(e => `
+              <tr>
+                <td>${new Date(e.timestamp).toLocaleTimeString()}</td>
+                <td>${esc(e.sku)}</td>
+                <td>$${e.old_price.toFixed(2)}</td>
+                <td class="${e.new_price > e.old_price ? 'price-up' : 'price-down'}">$${e.new_price.toFixed(2)}</td>
+                <td class="log-reason">${esc(e.reason)}</td>
+              </tr>
+            `).join('')}</tbody>
+          </table></div>
+        ` : '<div class="empty">No price changes yet. Run the engine to test.</div>'}
+      </div>
+
+      <!-- LISTINGS TAB -->
+      <div class="repricer-tab" id="repricer-listings">
+        <div class="table-wrap"><table>
+          <thead><tr>
+            <th>ASIN</th><th>SKU</th><th>Title</th><th>Price</th><th>Min</th><th>Max</th><th>Rank</th><th>Days Active</th><th>Last Repriced</th>
+          </tr></thead>
+          <tbody>${repricerListings.map(l => {
+            const daysActive = Math.floor((now - new Date(l.date_listed + 'T00:00:00')) / 86400000);
+            const repriced = l.last_repriced ? new Date(l.last_repriced).toLocaleDateString() : '--';
+            const atMinCls = l.current_price <= l.min_price ? ' red' : '';
+            const atMaxCls = l.current_price >= l.max_price ? ' green' : '';
+            return `<tr>
+              <td style="font-family:monospace;font-size:12px;">${esc(l.asin)}</td>
+              <td>${esc(l.sku)}</td>
+              <td>${esc(l.title)}</td>
+              <td class="${atMinCls}${atMaxCls}" style="font-weight:600;">$${l.current_price.toFixed(2)}</td>
+              <td>$${l.min_price.toFixed(2)}</td>
+              <td>$${l.max_price.toFixed(2)}</td>
+              <td>${l.sales_rank ? l.sales_rank.toLocaleString() : '--'}</td>
+              <td>${daysActive}d</td>
+              <td>${repriced}</td>
+            </tr>`;
+          }).join('')}</tbody>
+        </table></div>
+      </div>
+
+      <!-- RULES TAB -->
+      <div class="repricer-tab" id="repricer-rules">
+        <div class="rules-list">
+          ${REPRICER_RULES.map((rule, i) => `
+            <div class="rule-card">
+              <div class="rule-toggle">
+                <label class="toggle-switch">
+                  <input type="checkbox" ${rule.is_active ? 'checked' : ''} onchange="toggleRule(${i}, this.checked)">
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="rule-info">
+                <div class="rule-name">${esc(rule.rule_name)}</div>
+                <div class="rule-desc">${esc(rule.notes)}</div>
+                <div class="rule-fields">
+                  ${rule.rule_name === 'Max Hit Day 1' ? `
+                    <div class="rule-field">
+                      <label>Raise Amount ($)</label>
+                      <input type="number" step="0.50" min="0" value="${rule.max_hit_raise_amount || 3.00}" onchange="updateRuleField(${i}, 'max_hit_raise_amount', this.value)">
+                    </div>
+                  ` : ''}
+                  ${rule.rule_name === 'Stale Inventory' ? `
+                    <div class="rule-field">
+                      <label>Days Before Drop</label>
+                      <input type="number" step="1" min="1" value="${rule.days_before_drop || 30}" onchange="updateRuleField(${i}, 'days_before_drop', this.value)">
+                    </div>
+                    <div class="rule-field">
+                      <label>Drop Amount ($)</label>
+                      <input type="number" step="0.25" min="0" value="${rule.drop_amount || 0.50}" onchange="updateRuleField(${i}, 'drop_amount', this.value)">
+                    </div>
+                  ` : ''}
+                  ${rule.rule_name === 'Sales Rank Guard' ? `
+                    <div class="rule-field">
+                      <label>Rank Threshold</label>
+                      <input type="number" step="50000" min="0" value="${rule.target_position || 500000}" onchange="updateRuleField(${i}, 'target_position', this.value)">
+                    </div>
+                  ` : ''}
+                </div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+
+      <!-- LOG TAB -->
+      <div class="repricer-tab" id="repricer-log">
+        ${repricerLog.length === 0
+          ? '<div class="empty">No repricing log entries yet. Run the engine to generate entries.</div>'
+          : `<div class="table-wrap"><table>
+              <thead><tr><th>Timestamp</th><th>ASIN</th><th>SKU</th><th>Old Price</th><th>New Price</th><th>Reason</th></tr></thead>
+              <tbody>${repricerLog.map(e => `
+                <tr>
+                  <td>${new Date(e.timestamp).toLocaleString()}</td>
+                  <td style="font-family:monospace;font-size:12px;">${esc(e.asin)}</td>
+                  <td>${esc(e.sku)}</td>
+                  <td>$${e.old_price.toFixed(2)}</td>
+                  <td class="${e.new_price > e.old_price ? 'price-up' : 'price-down'}" style="font-weight:600;">$${e.new_price.toFixed(2)}</td>
+                  <td class="log-reason">${esc(e.reason)}</td>
+                </tr>
+              `).join('')}</tbody>
+            </table></div>`
+        }
+      </div>
+    </section>
+  `;
+}
+
+function switchRepricerTab(tab) {
+  document.querySelectorAll('.repricer-nav button').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.repricer-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('repricer-' + tab).classList.add('active');
+  const tabNames = ['overview', 'listings', 'rules', 'log'];
+  const idx = tabNames.indexOf(tab);
+  if (idx >= 0) {
+    document.querySelectorAll('.repricer-nav button')[idx].classList.add('active');
+  }
+}
+
+function toggleRule(index, active) {
+  REPRICER_RULES[index].is_active = active;
+}
+
+function updateRuleField(index, field, value) {
+  REPRICER_RULES[index][field] = parseFloat(value) || parseInt(value) || 0;
+}
+
+function handleRunRepricer() {
+  const entries = runRepricerEngine();
+  const section = document.getElementById('repricer-section');
+  const parent = section.parentElement;
+  section.outerHTML = renderRepricer();
+  // Show status
+  const status = document.getElementById('repricer-status');
+  if (entries.length > 0) {
+    status.className = 'repricer-status success';
+    status.textContent = 'Engine complete: ' + entries.length + ' price change' + (entries.length !== 1 ? 's' : '') + ' applied.';
+  } else {
+    status.className = 'repricer-status info';
+    status.textContent = 'Engine complete: no price changes needed.';
+  }
+}
+
+function handleResetRepricer() {
+  repricerListings = JSON.parse(JSON.stringify(MOCK_LISTINGS));
+  repricerLog = [];
+  REPRICER_RULES[0].is_active = true;
+  REPRICER_RULES[1].is_active = true; REPRICER_RULES[1].max_hit_raise_amount = 3.00;
+  REPRICER_RULES[2].is_active = true; REPRICER_RULES[2].days_before_drop = 30; REPRICER_RULES[2].drop_amount = 0.50;
+  REPRICER_RULES[3].is_active = true;
+  REPRICER_RULES[4].is_active = true; REPRICER_RULES[4].target_position = 500000;
+  const section = document.getElementById('repricer-section');
+  section.outerHTML = renderRepricer();
+  const status = document.getElementById('repricer-status');
+  status.className = 'repricer-status info';
+  status.textContent = 'Mock data reset to defaults.';
 }
 
 async function loadDashboard() {
@@ -656,6 +1203,9 @@ async function loadDashboard() {
           `).join('')
         }
       </section>
+
+      <!-- Repricer Section -->
+      ${renderRepricer()}
     </div>
   `;
 }
