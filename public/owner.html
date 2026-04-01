@@ -724,11 +724,12 @@ let testBuyBoxPrices = {}; // asin -> buyBoxPrice
 let testResults = []; // last test run results
 
 let REPRICER_RULES = [
-  { id: 1, rule_name: 'Default Floors', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: null, notes: 'Min $8.50, Max $24.99 for all listings unless overridden' },
-  { id: 2, rule_name: 'Max Hit Day 1', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: 3.00, target_position: null, notes: 'If listing hits max price on day 1, raise max by configured amount' },
-  { id: 3, rule_name: 'Stale Inventory', is_active: true, days_before_drop: 30, drop_amount: 0.50, max_hit_raise_amount: null, target_position: null, notes: 'Drop min price after configured days without a sale' },
-  { id: 4, rule_name: 'Never Below Cost', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: null, notes: 'No rule can drop price below cost_basis' },
-  { id: 5, rule_name: 'Sales Rank Guard', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: 500000, notes: 'Do not reprice downward if sales rank above threshold' },
+  { id: 0, rule_name: 'Match Buy Box', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: null, no_buybox_raise_amount: 1.00, notes: 'Match the Buy Box price within min/max bounds. If no Buy Box, raise price by configurable amount.' },
+  { id: 1, rule_name: 'Default Floors', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: null, no_buybox_raise_amount: null, notes: 'Min $8.50, Max $24.99 for all listings unless overridden' },
+  { id: 2, rule_name: 'Max Hit Day 1', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: 3.00, target_position: null, no_buybox_raise_amount: null, notes: 'If listing hits max price on day 1, raise max by configured amount' },
+  { id: 3, rule_name: 'Stale Inventory', is_active: true, days_before_drop: 30, drop_amount: 0.50, max_hit_raise_amount: null, target_position: null, no_buybox_raise_amount: null, notes: 'Drop min price after configured days without a sale' },
+  { id: 4, rule_name: 'Never Below Cost', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: null, no_buybox_raise_amount: null, notes: 'No rule can drop price below cost_basis' },
+  { id: 5, rule_name: 'Sales Rank Guard', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: 500000, no_buybox_raise_amount: null, notes: 'Do not reprice downward if sales rank above threshold' },
 ];
 
 // Load repricer data from Supabase on dashboard load
@@ -761,10 +762,35 @@ async function initRepricerData() {
   }
 }
 
+// buyBoxCache is populated by fetchBuyBoxForListings before engine runs
+let buyBoxCache = {};
+
+async function fetchBuyBoxForListings(listings) {
+  for (const l of listings) {
+    if (!l.asin) continue;
+    try {
+      const res = await callSpApi('getCompetitivePrice', { asin: l.asin });
+      if (res.payload && res.payload[0] && res.payload[0].Product) {
+        const prices = res.payload[0].Product.CompetitivePricing.CompetitivePrices || [];
+        const bb = prices.find(p => p.CompetitivePriceId === '1');
+        const low = prices.find(p => p.CompetitivePriceId === '2');
+        buyBoxCache[l.asin] = {
+          buyBox: bb ? bb.Price.LandedPrice.Amount : null,
+          lowest: low ? low.Price.LandedPrice.Amount : null,
+        };
+      } else {
+        buyBoxCache[l.asin] = { buyBox: null, lowest: null };
+      }
+    } catch (e) {
+      console.warn('Buy Box fetch failed for', l.asin, e);
+      buyBoxCache[l.asin] = { buyBox: null, lowest: null };
+    }
+  }
+}
+
 function runRepricerEngine() {
   const now = new Date();
   const newLogEntries = [];
-
   const skuFilter = /dvdbox|wiibox/i;
 
   for (const listing of repricerListings) {
@@ -773,6 +799,56 @@ function runRepricerEngine() {
 
     let newPrice = listing.current_price;
     let reason = null;
+
+    // Pre-pass: Adjust max (Max Hit Day 1)
+    const r2 = REPRICER_RULES.find(r => r.rule_name === 'Max Hit Day 1');
+    if (r2 && r2.is_active) {
+      const dateListed = new Date(listing.date_listed + 'T00:00:00');
+      const daysSinceListed = Math.floor((now - dateListed) / 86400000);
+      const raiseAmount = parseFloat(r2.max_hit_raise_amount) || 3.00;
+      if (daysSinceListed <= 1 && listing.current_price >= listing.max_price) {
+        listing.max_price = parseFloat((listing.max_price + raiseAmount).toFixed(2));
+      }
+    }
+
+    // Pre-pass: Adjust min (Stale Inventory)
+    const r3 = REPRICER_RULES.find(r => r.rule_name === 'Stale Inventory');
+    if (r3 && r3.is_active) {
+      const daysBefore = parseInt(r3.days_before_drop) || 30;
+      const dropAmount = parseFloat(r3.drop_amount) || 0.50;
+      const dateListed = new Date(listing.date_listed + 'T00:00:00');
+      const daysActive = Math.floor((now - dateListed) / 86400000);
+      const lastSold = listing.last_sold ? new Date(listing.last_sold) : null;
+      const daysSinceSale = lastSold ? Math.floor((now - lastSold) / 86400000) : daysActive;
+      if (daysSinceSale >= daysBefore) {
+        listing.min_price = parseFloat((listing.min_price - dropAmount).toFixed(2));
+      }
+    }
+
+    // Rule 0: Match Buy Box
+    const bbRule = REPRICER_RULES.find(r => r.rule_name === 'Match Buy Box');
+    if (bbRule && bbRule.is_active) {
+      const bbData = buyBoxCache[listing.asin];
+      const bbPrice = bbData ? bbData.buyBox : null;
+      const nobbRaise = parseFloat(bbRule.no_buybox_raise_amount) || 1.00;
+
+      if (bbPrice != null) {
+        if (bbPrice >= listing.min_price && bbPrice <= listing.max_price) {
+          newPrice = bbPrice;
+          reason = 'Match Buy Box: matched at $' + bbPrice.toFixed(2);
+        } else if (bbPrice < listing.min_price) {
+          newPrice = listing.min_price;
+          reason = 'Match Buy Box: BB $' + bbPrice.toFixed(2) + ' below min, set to min $' + listing.min_price.toFixed(2);
+        } else {
+          newPrice = listing.max_price;
+          reason = 'Match Buy Box: BB $' + bbPrice.toFixed(2) + ' above max, set to max $' + listing.max_price.toFixed(2);
+        }
+      } else {
+        const raised = Math.min(listing.current_price + nobbRaise, listing.max_price);
+        newPrice = parseFloat(raised.toFixed(2));
+        reason = 'No Buy Box - incremental raise of $' + nobbRaise.toFixed(2);
+      }
+    }
 
     // Rule 1: Default Floors
     const r1 = REPRICER_RULES.find(r => r.rule_name === 'Default Floors');
@@ -784,36 +860,6 @@ function runRepricerEngine() {
       if (newPrice > listing.max_price) {
         newPrice = listing.max_price;
         reason = 'Default Floors: price above maximum, lowered to max';
-      }
-    }
-
-    // Rule 2: Max Hit Day 1
-    const r2 = REPRICER_RULES.find(r => r.rule_name === 'Max Hit Day 1');
-    if (r2 && r2.is_active) {
-      const dateListed = new Date(listing.date_listed + 'T00:00:00');
-      const daysSinceListed = Math.floor((now - dateListed) / 86400000);
-      const raiseAmount = parseFloat(r2.max_hit_raise_amount) || 3.00;
-      if (daysSinceListed <= 1 && listing.current_price >= listing.max_price) {
-        listing.max_price = parseFloat((listing.max_price + raiseAmount).toFixed(2));
-        reason = 'Max Hit Day 1: hit max on day 1, raised max to $' + listing.max_price.toFixed(2) + ' (+$' + raiseAmount.toFixed(2) + ')';
-      }
-    }
-
-    // Rule 3: Stale Inventory
-    const r3 = REPRICER_RULES.find(r => r.rule_name === 'Stale Inventory');
-    if (r3 && r3.is_active) {
-      const daysBefore = parseInt(r3.days_before_drop) || 30;
-      const dropAmount = parseFloat(r3.drop_amount) || 0.50;
-      const dateListed = new Date(listing.date_listed + 'T00:00:00');
-      const daysActive = Math.floor((now - dateListed) / 86400000);
-      const lastSold = listing.last_sold ? new Date(listing.last_sold) : null;
-      const daysSinceSale = lastSold ? Math.floor((now - lastSold) / 86400000) : daysActive;
-      if (daysSinceSale >= daysBefore) {
-        const droppedPrice = parseFloat((newPrice - dropAmount).toFixed(2));
-        if (droppedPrice < newPrice) {
-          newPrice = droppedPrice;
-          reason = 'Stale Inventory: ' + daysSinceSale + ' days without sale, dropped $' + dropAmount.toFixed(2);
-        }
       }
     }
 
@@ -889,20 +935,28 @@ function renderRepricer() {
         ${(() => {
           const tl = getTestListings();
           if (tl.length === 0) return '<div class="empty">No test SKUs found in database. Click Sync from Amazon on the Overview tab first.</div>';
-          return '<div class="table-wrap"><table><thead><tr><th>SKU</th><th>ASIN</th><th>Title</th><th>Current Price</th><th>Min</th><th>Max</th><th>Buy Box</th><th>Sales Rank</th><th>Last Repriced</th></tr></thead><tbody>' +
+          return '<div class="table-wrap"><table><thead><tr><th>SKU</th><th>Title</th><th>My Price</th><th>Buy Box</th><th>Diff</th><th>Min</th><th>Max</th><th>Sales Rank</th><th>Last Repriced</th></tr></thead><tbody>' +
             tl.map(l => {
               const bb = testBuyBoxPrices[l.asin];
+              const bbPrice = bb ? bb.buyBox : null;
               const repriced = l.last_repriced ? new Date(l.last_repriced).toLocaleString() : '--';
+              let diffHtml = '<span style="color:#666;">--</span>';
+              if (bbPrice != null) {
+                const diff = l.current_price - bbPrice;
+                if (Math.abs(diff) < 0.01) diffHtml = '<span style="color:#22ff55;font-weight:600;">MATCHED</span>';
+                else if (diff > 0) diffHtml = '<span style="color:#ff4444;font-weight:600;">+$' + diff.toFixed(2) + ' above</span>';
+                else diffHtml = '<span style="color:#ffcc00;font-weight:600;">-$' + Math.abs(diff).toFixed(2) + ' below</span>';
+              }
               return '<tr>' +
                 '<td style="font-weight:600;">' + esc(l.sku) + '</td>' +
-                '<td style="font-family:monospace;font-size:12px;">' + esc(l.asin) + '</td>' +
                 '<td>' + esc(l.title) + '</td>' +
                 '<td style="font-weight:700;font-size:16px;">$' + l.current_price.toFixed(2) + '</td>' +
+                '<td style="font-weight:700;font-size:16px;">' + (bbPrice != null ? '<span style="color:#44aaff;">$' + bbPrice.toFixed(2) + '</span>' : '<span style="color:#666;">no BB</span>') + '</td>' +
+                '<td>' + diffHtml + '</td>' +
                 '<td>$' + l.min_price.toFixed(2) + '</td>' +
                 '<td>$' + l.max_price.toFixed(2) + '</td>' +
-                '<td>' + (bb ? (bb.buyBox != null ? '<span style="color:#44aaff;font-weight:600;">$' + bb.buyBox.toFixed(2) + '</span>' : '--') : '<span style="color:#666;">not fetched</span>') + '</td>' +
                 '<td>' + (l.sales_rank ? l.sales_rank.toLocaleString() : '--') + '</td>' +
-                '<td>' + repriced + '</td>' +
+                '<td style="font-size:12px;">' + repriced + '</td>' +
               '</tr>';
             }).join('') +
           '</tbody></table></div>';
@@ -1018,6 +1072,12 @@ function renderRepricer() {
                 <div class="rule-name">${esc(rule.rule_name)}</div>
                 <div class="rule-desc">${esc(rule.notes)}</div>
                 <div class="rule-fields">
+                  ${rule.rule_name === 'Match Buy Box' ? `
+                    <div class="rule-field">
+                      <label>No Buy Box Raise ($)</label>
+                      <input type="number" step="0.25" min="0" value="${rule.no_buybox_raise_amount || 1.00}" onchange="updateRuleField(${i}, 'no_buybox_raise_amount', this.value)">
+                    </div>
+                  ` : ''}
                   ${rule.rule_name === 'Max Hit Day 1' ? `
                     <div class="rule-field">
                       <label>Raise Amount ($)</label>
@@ -1098,8 +1158,14 @@ function updateRuleField(index, field, value) {
 
 async function handleRunRepricer() {
   const btn = document.querySelector('.btn-reprice.primary');
-  if (btn) { btn.disabled = true; btn.textContent = 'Running...'; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Fetching Buy Box prices...'; }
 
+  // Fetch Buy Box prices for all active listings before running engine
+  const skuFilter = /dvdbox|wiibox/i;
+  const activeListings = repricerListings.filter(l => l.status === 'active' && skuFilter.test(l.sku));
+  await fetchBuyBoxForListings(activeListings);
+
+  if (btn) { btn.textContent = 'Running engine...'; }
   const entries = runRepricerEngine();
 
   // Persist changes to Supabase if data came from DB
@@ -1253,34 +1319,30 @@ async function handleFetchTestBuyBox() {
 
 async function handleRunTestReprice() {
   const btn = document.getElementById('btn-test-reprice');
-  if (btn) { btn.disabled = true; btn.textContent = 'Running...'; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Fetching Buy Box prices...'; }
 
   const testListings = getTestListings();
   const now = new Date();
   testResults = [];
 
+  // Fetch Buy Box prices for test SKUs
+  await fetchBuyBoxForListings(testListings);
+  // Copy to testBuyBoxPrices for display
+  for (const l of testListings) {
+    if (buyBoxCache[l.asin]) testBuyBoxPrices[l.asin] = buyBoxCache[l.asin];
+  }
+
+  if (btn) { btn.textContent = 'Running rules...'; }
+
   for (const listing of testListings) {
     const result = { sku: listing.sku, asin: listing.asin, title: listing.title, old_price: listing.current_price, new_price: listing.current_price, decisions: [], changed: false };
+    const bbData = buyBoxCache[listing.asin];
+    const bbPrice = bbData ? bbData.buyBox : null;
+    result.buyBox = bbPrice;
 
     let newPrice = listing.current_price;
 
-    // Rule 1: Default Floors
-    const r1 = REPRICER_RULES.find(r => r.rule_name === 'Default Floors');
-    if (r1 && r1.is_active) {
-      if (newPrice < listing.min_price) {
-        result.decisions.push('Default Floors: $' + newPrice.toFixed(2) + ' below min $' + listing.min_price.toFixed(2) + ' → raised to min');
-        newPrice = listing.min_price;
-      } else if (newPrice > listing.max_price) {
-        result.decisions.push('Default Floors: $' + newPrice.toFixed(2) + ' above max $' + listing.max_price.toFixed(2) + ' → lowered to max');
-        newPrice = listing.max_price;
-      } else {
-        result.decisions.push('Default Floors: $' + newPrice.toFixed(2) + ' within range $' + listing.min_price.toFixed(2) + '–$' + listing.max_price.toFixed(2) + ' → no change');
-      }
-    } else {
-      result.decisions.push('Default Floors: DISABLED, skipped');
-    }
-
-    // Rule 2: Max Hit Day 1
+    // Pre-pass: Max Hit Day 1 (adjust max)
     const r2 = REPRICER_RULES.find(r => r.rule_name === 'Max Hit Day 1');
     if (r2 && r2.is_active) {
       const dateListed = new Date(listing.date_listed + 'T00:00:00');
@@ -1296,7 +1358,7 @@ async function handleRunTestReprice() {
       result.decisions.push('Max Hit Day 1: DISABLED, skipped');
     }
 
-    // Rule 3: Stale Inventory
+    // Pre-pass: Stale Inventory (adjust min)
     const r3 = REPRICER_RULES.find(r => r.rule_name === 'Stale Inventory');
     if (r3 && r3.is_active) {
       const daysBefore = parseInt(r3.days_before_drop) || 30;
@@ -1306,14 +1368,54 @@ async function handleRunTestReprice() {
       const lastSold = listing.last_sold ? new Date(listing.last_sold) : null;
       const daysSinceSale = lastSold ? Math.floor((now - lastSold) / 86400000) : daysActive;
       if (daysSinceSale >= daysBefore) {
-        const droppedPrice = parseFloat((newPrice - dropAmount).toFixed(2));
-        result.decisions.push('Stale Inventory: ' + daysSinceSale + 'd without sale (threshold ' + daysBefore + 'd) → drop $' + dropAmount.toFixed(2) + ' from $' + newPrice.toFixed(2) + ' to $' + droppedPrice.toFixed(2));
-        newPrice = droppedPrice;
+        const oldMin = listing.min_price;
+        listing.min_price = parseFloat((listing.min_price - dropAmount).toFixed(2));
+        result.decisions.push('Stale Inventory: ' + daysSinceSale + 'd without sale (threshold ' + daysBefore + 'd) → lowered min from $' + oldMin.toFixed(2) + ' to $' + listing.min_price.toFixed(2));
       } else {
         result.decisions.push('Stale Inventory: ' + daysSinceSale + 'd without sale (threshold ' + daysBefore + 'd) → not stale yet');
       }
     } else {
       result.decisions.push('Stale Inventory: DISABLED, skipped');
+    }
+
+    // Rule 0: Match Buy Box
+    const bbRule = REPRICER_RULES.find(r => r.rule_name === 'Match Buy Box');
+    if (bbRule && bbRule.is_active) {
+      const nobbRaise = parseFloat(bbRule.no_buybox_raise_amount) || 1.00;
+      if (bbPrice != null) {
+        if (bbPrice >= listing.min_price && bbPrice <= listing.max_price) {
+          newPrice = bbPrice;
+          result.decisions.push('Match Buy Box: BB $' + bbPrice.toFixed(2) + ' within min $' + listing.min_price.toFixed(2) + '–max $' + listing.max_price.toFixed(2) + ' → matched at $' + bbPrice.toFixed(2));
+        } else if (bbPrice < listing.min_price) {
+          newPrice = listing.min_price;
+          result.decisions.push('Match Buy Box: BB $' + bbPrice.toFixed(2) + ' below min $' + listing.min_price.toFixed(2) + ' → set to min');
+        } else {
+          newPrice = listing.max_price;
+          result.decisions.push('Match Buy Box: BB $' + bbPrice.toFixed(2) + ' above max $' + listing.max_price.toFixed(2) + ' → set to max');
+        }
+      } else {
+        const raised = Math.min(listing.current_price + nobbRaise, listing.max_price);
+        newPrice = parseFloat(raised.toFixed(2));
+        result.decisions.push('Match Buy Box: No Buy Box found → incremental raise of $' + nobbRaise.toFixed(2) + ' to $' + newPrice.toFixed(2));
+      }
+    } else {
+      result.decisions.push('Match Buy Box: DISABLED, skipped');
+    }
+
+    // Rule 1: Default Floors
+    const r1 = REPRICER_RULES.find(r => r.rule_name === 'Default Floors');
+    if (r1 && r1.is_active) {
+      if (newPrice < listing.min_price) {
+        result.decisions.push('Default Floors: $' + newPrice.toFixed(2) + ' below min $' + listing.min_price.toFixed(2) + ' → raised to min');
+        newPrice = listing.min_price;
+      } else if (newPrice > listing.max_price) {
+        result.decisions.push('Default Floors: $' + newPrice.toFixed(2) + ' above max $' + listing.max_price.toFixed(2) + ' → lowered to max');
+        newPrice = listing.max_price;
+      } else {
+        result.decisions.push('Default Floors: $' + newPrice.toFixed(2) + ' within range $' + listing.min_price.toFixed(2) + '–$' + listing.max_price.toFixed(2) + ' → OK');
+      }
+    } else {
+      result.decisions.push('Default Floors: DISABLED, skipped');
     }
 
     // Rule 4: Never Below Cost
@@ -1353,16 +1455,14 @@ async function handleRunTestReprice() {
 
     if (result.changed) {
       result.decisions.push('FINAL: price changed $' + listing.current_price.toFixed(2) + ' → $' + newPrice.toFixed(2));
-      // Save to log with TEST tag
       const logEntry = {
         asin: listing.asin,
         sku: listing.sku,
         old_price: listing.current_price,
         new_price: newPrice,
-        reason: 'TEST: ' + result.decisions.filter(d => !d.includes('no change') && !d.includes('no trigger') && !d.includes('not stale') && !d.includes('OK') && !d.includes('skipped')).join('; '),
+        reason: 'TEST: ' + result.decisions.filter(d => !d.includes('no change') && !d.includes('no trigger') && !d.includes('not stale') && !d.includes('→ OK') && !d.includes('skipped')).join('; '),
       };
       await saveLogEntry(logEntry);
-      // Update listing in DB
       if (listing.id) {
         await updateListingInDb(listing.id, { current_price: newPrice, last_repriced: now.toISOString() });
       }
