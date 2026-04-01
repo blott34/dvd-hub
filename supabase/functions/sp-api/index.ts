@@ -108,99 +108,64 @@ async function spApiRequest(path: string, method = "GET", body?: unknown): Promi
 }
 
 /**
- * Dynamically fetch the seller ID from Amazon's Marketplace Participations API.
- * Logs the full raw response for debugging, then extracts the seller ID
- * for the target marketplace. Falls back to env var ONLY if API call fails entirely.
+ * Dynamically fetch the seller ID from the Sellers API account endpoint.
+ * GET /sellers/v1/account returns the selling partner account info
+ * including the merchant token (which IS the seller ID).
+ * Logs the full raw response for debugging.
  */
 async function getActiveSellerId(): Promise<string> {
   if (cachedSellerId) return cachedSellerId;
 
   const envSellerId = Deno.env.get("SP_API_SELLER_ID") || "";
-  const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
 
   console.log("========================================");
-  console.log("=== DISCOVERING SELLER ID ===");
-  console.log("Target marketplace:", marketplaceId);
+  console.log("=== DISCOVERING SELLER ID via /sellers/v1/account ===");
   console.log("Env var SP_API_SELLER_ID:", envSellerId);
   console.log("========================================");
 
   try {
-    const result = await spApiRequest("/sellers/v1/marketplaceParticipations");
+    const result = await spApiRequest("/sellers/v1/account");
 
-    console.log("=== FULL MARKETPLACE PARTICIPATIONS RESPONSE ===");
+    console.log("=== FULL /sellers/v1/account RESPONSE ===");
     console.log(JSON.stringify(result, null, 2));
     console.log("=== END RESPONSE ===");
 
-    // The response could be structured in multiple ways depending on API version:
-    // Option A: { payload: [ { marketplace: { id }, participation: { sellerId } } ] }
-    // Option B: Direct array at top level
-    // Option C: Nested differently
-    // We search all possible paths for the seller ID.
-
+    // Walk the entire response looking for any field that could be the seller ID.
+    // Possible field names: merchantToken, sellerId, sellingPartnerId, merchantId, id
     const resultObj = result as Record<string, unknown>;
 
-    // Try to get the array of participations
-    let participations: unknown[] | null = null;
-    if (Array.isArray(resultObj.payload)) {
-      participations = resultObj.payload;
-    } else if (Array.isArray(result)) {
-      participations = result as unknown[];
-    }
+    // Check top-level and payload-wrapped responses
+    const searchTargets = [resultObj, resultObj.payload as Record<string, unknown>].filter(Boolean);
 
-    if (participations) {
-      console.log("Found", participations.length, "marketplace participation(s)");
+    const candidateKeys = ["merchantToken", "sellerId", "sellingPartnerId", "merchantId", "merchant_token", "seller_id"];
 
-      // Search every participation for our target marketplace
-      for (const entry of participations) {
-        const e = entry as Record<string, unknown>;
-        console.log("--- Participation entry ---");
-        console.log(JSON.stringify(e, null, 2));
-
-        // Extract marketplace ID — could be at multiple paths
-        const mkt = e.marketplace as Record<string, unknown> | undefined;
-        const mktId = mkt?.id as string | undefined;
-
-        // Extract seller ID — could be at multiple paths
-        const participation = e.participation as Record<string, unknown> | undefined;
-        let foundSellerId = participation?.sellerId as string | undefined;
-
-        // Some responses put sellerId directly on the entry
-        if (!foundSellerId) {
-          foundSellerId = e.sellerId as string | undefined;
-        }
-
-        console.log("  marketplace.id:", mktId);
-        console.log("  sellerId:", foundSellerId);
-
-        if (mktId === marketplaceId && foundSellerId) {
+    for (const target of searchTargets) {
+      for (const key of candidateKeys) {
+        const val = target[key];
+        if (typeof val === "string" && val.length > 0) {
           console.log("========================================");
-          console.log("=== MATCHED! Using seller ID:", foundSellerId);
-          if (envSellerId && foundSellerId !== envSellerId) {
-            console.warn("!!! WARNING: Env var SP_API_SELLER_ID=" + envSellerId + " does NOT match discovered seller ID=" + foundSellerId);
+          console.log(`=== FOUND seller ID from field "${key}":`, val);
+          if (envSellerId && val !== envSellerId) {
+            console.warn("!!! WARNING: Env var SP_API_SELLER_ID=" + envSellerId + " does NOT match discovered ID=" + val);
           }
           console.log("========================================");
-          cachedSellerId = foundSellerId;
-          return foundSellerId;
+          cachedSellerId = val;
+          return val;
         }
       }
 
-      // If we didn't find an exact marketplace match, grab the first sellerId we can find
-      console.log("No exact marketplace match found. Checking first available seller ID...");
-      for (const entry of participations) {
-        const e = entry as Record<string, unknown>;
-        const participation = e.participation as Record<string, unknown> | undefined;
-        const fallbackId = (participation?.sellerId || e.sellerId) as string | undefined;
-        if (fallbackId) {
-          console.log("Using first available seller ID:", fallbackId);
-          cachedSellerId = fallbackId;
-          return fallbackId;
+      // Deep search: walk all string values looking for an Amazon seller ID pattern (starts with A, 13-14 chars)
+      for (const [key, val] of Object.entries(target)) {
+        if (typeof val === "string" && /^A[A-Z0-9]{12,13}$/.test(val) && !candidateKeys.includes(key)) {
+          console.log(`=== POSSIBLE seller ID in field "${key}":`, val);
         }
       }
     }
 
-    console.error("Could not extract seller ID from marketplace participations response!");
+    console.error("Could not extract seller ID from /sellers/v1/account response.");
+    console.log("Dumping all top-level keys:", Object.keys(resultObj));
   } catch (err) {
-    console.error("Failed to call marketplace participations API:", err);
+    console.error("Failed to call /sellers/v1/account:", err);
   }
 
   // Last resort: env var
@@ -515,6 +480,26 @@ async function handleGetSalesRankBatch(asins: string[]): Promise<unknown> {
   return results;
 }
 
+async function handleTestCatalog(asin: string): Promise<unknown> {
+  const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
+
+  console.log("========================================");
+  console.log("=== TEST: Catalog Items API read ===");
+  console.log("ASIN:", asin);
+  console.log("Marketplace:", marketplaceId);
+  console.log("========================================");
+
+  // This is a simple GET — no seller ID needed — to verify the access token works
+  const result = await spApiRequest(
+    `/catalog/2022-04-01/items/${asin}?marketplaceIds=${marketplaceId}&includedData=summaries,salesRanks,attributes`
+  );
+
+  console.log("=== CATALOG RESPONSE ===");
+  console.log(JSON.stringify(result, null, 2));
+
+  return { action: "testCatalog", asin, result };
+}
+
 // ---- Main Handler ----
 
 serve(async (req: Request) => {
@@ -567,8 +552,13 @@ serve(async (req: Request) => {
         result = await handleVerifySeller();
         break;
 
+      case "testCatalog":
+        if (!params.asin) throw new Error("Missing required param: asin");
+        result = await handleTestCatalog(params.asin);
+        break;
+
       default:
-        throw new Error(`Unknown action: ${action}. Valid: fetchListings, getCompetitivePrice, getCompetitivePriceBatch, updatePrice, getSalesRank, getSalesRankBatch, getListingInfo, verifySeller`);
+        throw new Error(`Unknown action: ${action}. Valid: fetchListings, getCompetitivePrice, getCompetitivePriceBatch, updatePrice, getSalesRank, getSalesRankBatch, getListingInfo, verifySeller, testCatalog`);
     }
 
     return new Response(JSON.stringify(result), {
