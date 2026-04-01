@@ -80,3 +80,11 @@ export async function getSalesRank(asin) {
 export async function getSalesRankBatch(asins) {
   return await callSpApi('getSalesRankBatch', { asins });
 }
+
+/**
+ * Get full listing details from Amazon (summaries, attributes, offers, issues)
+ * Useful for debugging — returns productType, seller ID, and all listing data
+ */
+export async function getListingInfo(sku) {
+  return await callSpApi('getListingInfo', { sku });
+}

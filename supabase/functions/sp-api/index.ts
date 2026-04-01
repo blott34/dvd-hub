@@ -24,6 +24,7 @@ const LWA_TOKEN_URL = "https://api.amazon.com/auth/o2/token";
 // Cache access token in memory (edge functions are short-lived, but avoids
 // re-fetching within the same invocation for multi-action requests)
 let cachedToken: { token: string; expiresAt: number } | null = null;
+let cachedSellerId: string | null = null;
 
 async function getAccessToken(): Promise<string> {
   const now = Date.now();
@@ -104,6 +105,48 @@ async function spApiRequest(path: string, method = "GET", body?: unknown): Promi
   } catch {
     return { raw: responseBody };
   }
+}
+
+/**
+ * Dynamically fetch the seller ID from Amazon's Marketplace Participations API.
+ * Falls back to SP_API_SELLER_ID env var if the API call fails.
+ * Caches the result for the lifetime of this edge function invocation.
+ */
+async function getActiveSellerId(): Promise<string> {
+  if (cachedSellerId) return cachedSellerId;
+
+  const envSellerId = Deno.env.get("SP_API_SELLER_ID") || "";
+  const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
+
+  try {
+    const result = await spApiRequest("/sellers/v1/marketplaceParticipations") as { payload?: Array<{ marketplace?: { id?: string }; participation?: { sellerId?: string } }> };
+
+    if (result && Array.isArray(result.payload)) {
+      // Find the participation matching our target marketplace
+      const match = result.payload.find(
+        (p) => p.marketplace?.id === marketplaceId
+      );
+      const dynamicId = match?.participation?.sellerId;
+
+      if (dynamicId) {
+        console.log("=== SELLER ID ===");
+        console.log("Dynamic (from API):", dynamicId);
+        console.log("Env var:", envSellerId);
+        if (envSellerId && dynamicId !== envSellerId) {
+          console.warn("WARNING: SP_API_SELLER_ID env var does NOT match API-returned seller ID!");
+        }
+        cachedSellerId = dynamicId;
+        return dynamicId;
+      }
+    }
+  } catch (err) {
+    console.error("Failed to fetch seller ID dynamically:", err);
+  }
+
+  // Fallback to env var
+  console.log("Using SP_API_SELLER_ID env var as fallback:", envSellerId);
+  cachedSellerId = envSellerId;
+  return envSellerId;
 }
 
 function sleep(ms: number) {
@@ -221,14 +264,14 @@ async function handleGetCompetitivePriceBatch(asins: string[]): Promise<unknown>
 }
 
 async function handleGetListingInfo(sku: string): Promise<unknown> {
-  const sellerId = Deno.env.get("SP_API_SELLER_ID") || "";
+  const sellerId = await getActiveSellerId();
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
   const encodedSku = encodeURIComponent(sku);
 
   const result = await spApiRequest(
     `/listings/2021-08-01/items/${sellerId}/${encodedSku}?marketplaceIds=${marketplaceId}&includedData=summaries,attributes,offers,issues&issueLocale=en_US`
   );
-  return result;
+  return { sellerId, marketplaceId, sku, ...result as Record<string, unknown> };
 }
 
 async function handleVerifySeller(): Promise<unknown> {
@@ -237,13 +280,14 @@ async function handleVerifySeller(): Promise<unknown> {
 }
 
 async function handleUpdatePrice(sku: string, price: number): Promise<unknown> {
-  const sellerId = Deno.env.get("SP_API_SELLER_ID") || "";
+  const sellerId = await getActiveSellerId();
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
   const encodedSku = encodeURIComponent(sku);
   const priceStr = price.toFixed(2);
 
-  // Step 1: GET the listing to discover the real productType
+  // Step 1: GET the listing to discover the real productType and confirm seller ID
   console.log("=== FETCHING LISTING INFO FOR PRODUCT TYPE ===");
+  console.log("Using dynamic seller ID:", sellerId);
   const listingInfo = await spApiRequest(
     `/listings/2021-08-01/items/${sellerId}/${encodedSku}?marketplaceIds=${marketplaceId}&includedData=summaries,attributes&issueLocale=en_US`
   ) as Record<string, unknown>;
@@ -300,7 +344,7 @@ async function handleUpdatePrice(sku: string, price: number): Promise<unknown> {
 
   // If PATCH succeeded, return it
   if (!patchResult.error) {
-    return { method: "PATCH", productType, ...patchResult };
+    return { method: "PATCH", productType, sellerId, ...patchResult };
   }
 
   console.log("=== PATCH FAILED, TRYING FEEDS API FALLBACK ===");
