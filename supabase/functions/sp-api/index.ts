@@ -288,13 +288,106 @@ async function handleFetchListings(): Promise<unknown> {
     }
   }
 
+  // Step 6: Fetch real-time prices via Pricing API (GET /products/pricing/v0/price?Skus=...)
+  // The report price can be stale — this gives the actual current listing price.
+  const skus = listings.map((l) => l.sku).filter(Boolean);
+  console.log("========================================");
+  console.log("=== FETCHING REAL-TIME PRICES for", skus.length, "SKUs ===");
+  console.log("========================================");
+
+  const livePriceMap: Record<string, number> = {};
+  // Pricing API supports up to 20 SKUs per request
+  const PRICE_BATCH = 20;
+  for (let i = 0; i < skus.length; i += PRICE_BATCH) {
+    const batch = skus.slice(i, i + PRICE_BATCH);
+    const skuParam = batch.map((s) => encodeURIComponent(s)).join("&Skus=");
+    try {
+      const priceRes = await spApiRequest(
+        `/products/pricing/v0/price?MarketplaceId=${marketplaceId}&Skus=${skuParam}&ItemType=Sku`
+      ) as Record<string, unknown>;
+
+      console.log("Pricing API response for batch", Math.floor(i / PRICE_BATCH) + 1 + ":");
+      console.log(JSON.stringify(priceRes, null, 2));
+
+      // Response: { payload: [ { status: "Success", SKU, Product: { Offers: [{ BuyingPrice: { ListingPrice: { Amount } } }] } } ] }
+      const payload = priceRes.payload as Array<Record<string, unknown>> | undefined;
+      if (payload && Array.isArray(payload)) {
+        for (const item of payload) {
+          const itemStatus = item.status as string || item.Status as string || "";
+          const sku = (item.SKU || item.SellerSKU || item.seller_sku || item.sku) as string;
+          if (!sku) continue;
+
+          if (itemStatus !== "Success") {
+            console.log(`  [${sku}] Pricing status: ${itemStatus}`);
+            continue;
+          }
+
+          // Extract price from multiple possible response paths
+          const product = item.Product as Record<string, unknown> | undefined;
+          let livePrice: number | null = null;
+
+          if (product) {
+            // Path 1: Product.Offers[].BuyingPrice.ListingPrice.Amount
+            const offers = product.Offers as Array<Record<string, unknown>> | undefined;
+            if (offers && offers.length > 0) {
+              const buyingPrice = offers[0].BuyingPrice as Record<string, unknown> | undefined;
+              if (buyingPrice) {
+                const listingPrice = buyingPrice.ListingPrice as Record<string, unknown> | undefined;
+                if (listingPrice) {
+                  const amt = parseFloat(listingPrice.Amount as string || "0");
+                  if (amt > 0) livePrice = amt;
+                }
+              }
+              // Path 2: Product.Offers[].RegularPrice.Amount
+              if (livePrice === null) {
+                const regularPrice = offers[0].RegularPrice as Record<string, unknown> | undefined;
+                if (regularPrice) {
+                  const amt = parseFloat(regularPrice.Amount as string || "0");
+                  if (amt > 0) livePrice = amt;
+                }
+              }
+            }
+          }
+
+          if (livePrice !== null) {
+            livePriceMap[sku] = livePrice;
+            console.log(`  [${sku}] Live price: $${livePrice.toFixed(2)}`);
+          } else {
+            console.log(`  [${sku}] Could not extract price from response`);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("Pricing API batch failed:", err);
+    }
+
+    if (i + PRICE_BATCH < skus.length) {
+      await sleep(500);
+    }
+  }
+
+  // Override report prices with live prices
+  let pricesUpdated = 0;
+  for (const listing of listings) {
+    if (listing.sku && livePriceMap[listing.sku] !== undefined) {
+      const reportPrice = listing.current_price;
+      listing.current_price = livePriceMap[listing.sku];
+      if (reportPrice !== listing.current_price) {
+        console.log(`  [${listing.sku}] Price updated: $${reportPrice.toFixed(2)} (report) → $${listing.current_price.toFixed(2)} (live)`);
+        pricesUpdated++;
+      }
+    }
+  }
+
   console.log("========================================");
   console.log("=== SYNC COMPLETE ===");
   console.log("Listings with sales rank:", listings.filter((l) => l.sales_rank !== null).length);
+  console.log("Listings with live price:", Object.keys(livePriceMap).length);
+  console.log("Prices changed from report:", pricesUpdated);
   console.log("Total listings returned:", listings.length);
   console.log("========================================");
 
-  return { listings, totalRaw: rows.length, salesRanksFound: Object.keys(salesRankMap).length };
+  return { listings, totalRaw: rows.length, salesRanksFound: Object.keys(salesRankMap).length, livePricesFound: Object.keys(livePriceMap).length, pricesUpdated };
 }
 
 async function handleGetCompetitivePrice(asin: string): Promise<unknown> {
