@@ -718,6 +718,11 @@ let repricerLog = [];
 let repricerDataSource = 'db'; // 'db' or 'mock'
 let repricerLoading = false;
 
+// ===== TEST MODE =====
+const TEST_SKUS = ['DVDBOX-1.05-01352', 'DVDBOX-1.05-01347', 'DVDBOX-1.05-01364'];
+let testBuyBoxPrices = {}; // asin -> buyBoxPrice
+let testResults = []; // last test run results
+
 let REPRICER_RULES = [
   { id: 1, rule_name: 'Default Floors', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: null, notes: 'Min $8.50, Max $24.99 for all listings unless overridden' },
   { id: 2, rule_name: 'Max Hit Day 1', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: 3.00, target_position: null, notes: 'If listing hits max price on day 1, raise max by configured amount' },
@@ -867,14 +872,65 @@ function renderRepricer() {
     <section class="section" id="repricer-section">
       <h2>Repricer</h2>
       <div class="repricer-nav">
-        <button class="active" onclick="switchRepricerTab('overview')">Overview</button>
+        <button onclick="switchRepricerTab('test')" style="color:#ffcc00;border-bottom-color:#ffcc00;" class="active">Test Mode</button>
+        <button onclick="switchRepricerTab('overview')">Overview</button>
         <button onclick="switchRepricerTab('listings')">Listings</button>
         <button onclick="switchRepricerTab('rules')">Rules</button>
         <button onclick="switchRepricerTab('log')">Log</button>
       </div>
 
+      <!-- TEST MODE TAB -->
+      <div class="repricer-tab active" id="repricer-test">
+        <div style="padding:10px 16px;margin-bottom:14px;background:#1a1500;border:1px solid #4a3a00;border-radius:8px;font-size:13px;color:#ffcc00;">Test Mode — Only these 3 SKUs: ${TEST_SKUS.join(', ')}</div>
+        <div class="repricer-actions" style="margin-bottom:12px;">
+          <button class="btn-reprice primary" id="btn-test-reprice" onclick="handleRunTestReprice()">Run Test Reprice</button>
+        </div>
+        <div class="repricer-status" id="test-status"></div>
+        ${(() => {
+          const tl = getTestListings();
+          if (tl.length === 0) return '<div class="empty">No test SKUs found in database. Click Sync from Amazon on the Overview tab first.</div>';
+          return '<div class="table-wrap"><table><thead><tr><th>SKU</th><th>ASIN</th><th>Title</th><th>Current Price</th><th>Min</th><th>Max</th><th>Buy Box</th><th>Sales Rank</th><th>Last Repriced</th></tr></thead><tbody>' +
+            tl.map(l => {
+              const bb = testBuyBoxPrices[l.asin];
+              const repriced = l.last_repriced ? new Date(l.last_repriced).toLocaleString() : '--';
+              return '<tr>' +
+                '<td style="font-weight:600;">' + esc(l.sku) + '</td>' +
+                '<td style="font-family:monospace;font-size:12px;">' + esc(l.asin) + '</td>' +
+                '<td>' + esc(l.title) + '</td>' +
+                '<td style="font-weight:700;font-size:16px;">$' + l.current_price.toFixed(2) + '</td>' +
+                '<td>$' + l.min_price.toFixed(2) + '</td>' +
+                '<td>$' + l.max_price.toFixed(2) + '</td>' +
+                '<td>' + (bb ? (bb.buyBox != null ? '<span style="color:#44aaff;font-weight:600;">$' + bb.buyBox.toFixed(2) + '</span>' : '--') : '<span style="color:#666;">not fetched</span>') + '</td>' +
+                '<td>' + (l.sales_rank ? l.sales_rank.toLocaleString() : '--') + '</td>' +
+                '<td>' + repriced + '</td>' +
+              '</tr>';
+            }).join('') +
+          '</tbody></table></div>';
+        })()}
+        ${testResults.length > 0 ? '<h3 style="font-size:12px;color:#ffcc00;text-transform:uppercase;letter-spacing:0.5px;margin:20px 0 12px;">Last Test Run — Decision Log</h3>' +
+          testResults.map(r => {
+            return '<div style="background:#111;border-radius:8px;padding:16px 20px;margin-bottom:10px;border-left:3px solid ' + (r.changed ? '#22ff55' : '#444') + ';">' +
+              '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">' +
+                '<span style="font-weight:700;color:#fff;">' + esc(r.sku) + '</span>' +
+                '<span style="font-size:14px;">' + (r.changed ? '<span class="price-down">$' + r.old_price.toFixed(2) + '</span> → <span class="price-up">$' + r.new_price.toFixed(2) + '</span>' : '<span style="color:#888;">No change — $' + r.old_price.toFixed(2) + '</span>') + '</span>' +
+              '</div>' +
+              '<div style="font-size:12px;color:#aaa;">' + esc(r.title) + '</div>' +
+              '<div style="margin-top:8px;font-size:13px;color:#ccc;">' +
+                r.decisions.map(d => {
+                  let color = '#888';
+                  if (d.startsWith('FINAL:')) color = r.changed ? '#22ff55' : '#666';
+                  else if (d.includes('BLOCKED') || d.includes('floored')) color = '#ff4444';
+                  else if (d.includes('→ raised') || d.includes('→ drop')) color = '#ffcc00';
+                  else if (d.includes('DISABLED')) color = '#555';
+                  return '<div style="padding:3px 0;color:' + color + ';">' + esc(d) + '</div>';
+                }).join('') +
+              '</div>' +
+            '</div>';
+          }).join('') : ''}
+      </div>
+
       <!-- OVERVIEW TAB -->
-      <div class="repricer-tab active" id="repricer-overview">
+      <div class="repricer-tab" id="repricer-overview">
         <div class="repricer-summary">
           <div class="stat">
             <div class="stat-val blue">${active.length}</div>
@@ -1018,7 +1074,7 @@ function switchRepricerTab(tab) {
   document.querySelectorAll('.repricer-nav button').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('.repricer-tab').forEach(t => t.classList.remove('active'));
   document.getElementById('repricer-' + tab).classList.add('active');
-  const tabNames = ['overview', 'listings', 'rules', 'log'];
+  const tabNames = ['test', 'overview', 'listings', 'rules', 'log'];
   const idx = tabNames.indexOf(tab);
   if (idx >= 0) {
     document.querySelectorAll('.repricer-nav button')[idx].classList.add('active');
@@ -1159,6 +1215,178 @@ async function handleRefreshFromDb() {
   if (status) {
     status.className = 'repricer-status info';
     status.textContent = 'Reloaded ' + repricerListings.length + ' listings from database.';
+  }
+}
+
+// ===== TEST MODE FUNCTIONS =====
+function getTestListings() {
+  return repricerListings.filter(l => TEST_SKUS.includes(l.sku));
+}
+
+async function handleFetchTestBuyBox() {
+  const testListings = getTestListings();
+  if (testListings.length === 0) return;
+  const statusEl = document.getElementById('test-status');
+  if (statusEl) { statusEl.className = 'repricer-status info'; statusEl.textContent = 'Fetching Buy Box prices...'; }
+  try {
+    for (const l of testListings) {
+      const res = await callSpApi('getCompetitivePrice', { asin: l.asin });
+      if (res.payload && res.payload[0] && res.payload[0].Product) {
+        const prices = res.payload[0].Product.CompetitivePricing.CompetitivePrices || [];
+        const buyBox = prices.find(p => p.CompetitivePriceId === '1');
+        const lowest = prices.find(p => p.CompetitivePriceId === '2');
+        testBuyBoxPrices[l.asin] = {
+          buyBox: buyBox ? buyBox.Price.LandedPrice.Amount : null,
+          lowest: lowest ? lowest.Price.LandedPrice.Amount : null,
+        };
+      }
+    }
+    const section = document.getElementById('repricer-section');
+    section.outerHTML = renderRepricer();
+    switchRepricerTab('test');
+    const newStatus = document.getElementById('test-status');
+    if (newStatus) { newStatus.className = 'repricer-status success'; newStatus.textContent = 'Buy Box prices updated.'; }
+  } catch (e) {
+    if (statusEl) { statusEl.className = 'repricer-status'; statusEl.style.display = 'block'; statusEl.style.background = '#2a0a0a'; statusEl.style.color = '#ff4444'; statusEl.style.borderColor = '#4a1a1a'; statusEl.textContent = 'Error: ' + e.message; }
+  }
+}
+
+async function handleRunTestReprice() {
+  const btn = document.getElementById('btn-test-reprice');
+  if (btn) { btn.disabled = true; btn.textContent = 'Running...'; }
+
+  const testListings = getTestListings();
+  const now = new Date();
+  testResults = [];
+
+  for (const listing of testListings) {
+    const result = { sku: listing.sku, asin: listing.asin, title: listing.title, old_price: listing.current_price, new_price: listing.current_price, decisions: [], changed: false };
+
+    let newPrice = listing.current_price;
+
+    // Rule 1: Default Floors
+    const r1 = REPRICER_RULES.find(r => r.rule_name === 'Default Floors');
+    if (r1 && r1.is_active) {
+      if (newPrice < listing.min_price) {
+        result.decisions.push('Default Floors: $' + newPrice.toFixed(2) + ' below min $' + listing.min_price.toFixed(2) + ' → raised to min');
+        newPrice = listing.min_price;
+      } else if (newPrice > listing.max_price) {
+        result.decisions.push('Default Floors: $' + newPrice.toFixed(2) + ' above max $' + listing.max_price.toFixed(2) + ' → lowered to max');
+        newPrice = listing.max_price;
+      } else {
+        result.decisions.push('Default Floors: $' + newPrice.toFixed(2) + ' within range $' + listing.min_price.toFixed(2) + '–$' + listing.max_price.toFixed(2) + ' → no change');
+      }
+    } else {
+      result.decisions.push('Default Floors: DISABLED, skipped');
+    }
+
+    // Rule 2: Max Hit Day 1
+    const r2 = REPRICER_RULES.find(r => r.rule_name === 'Max Hit Day 1');
+    if (r2 && r2.is_active) {
+      const dateListed = new Date(listing.date_listed + 'T00:00:00');
+      const daysSinceListed = Math.floor((now - dateListed) / 86400000);
+      const raiseAmount = parseFloat(r2.max_hit_raise_amount) || 3.00;
+      if (daysSinceListed <= 1 && listing.current_price >= listing.max_price) {
+        listing.max_price = parseFloat((listing.max_price + raiseAmount).toFixed(2));
+        result.decisions.push('Max Hit Day 1: listed ' + daysSinceListed + 'd ago at max → raised max to $' + listing.max_price.toFixed(2));
+      } else {
+        result.decisions.push('Max Hit Day 1: listed ' + daysSinceListed + 'd ago, price $' + listing.current_price.toFixed(2) + ' vs max $' + listing.max_price.toFixed(2) + ' → no trigger');
+      }
+    } else {
+      result.decisions.push('Max Hit Day 1: DISABLED, skipped');
+    }
+
+    // Rule 3: Stale Inventory
+    const r3 = REPRICER_RULES.find(r => r.rule_name === 'Stale Inventory');
+    if (r3 && r3.is_active) {
+      const daysBefore = parseInt(r3.days_before_drop) || 30;
+      const dropAmount = parseFloat(r3.drop_amount) || 0.50;
+      const dateListed = new Date(listing.date_listed + 'T00:00:00');
+      const daysActive = Math.floor((now - dateListed) / 86400000);
+      const lastSold = listing.last_sold ? new Date(listing.last_sold) : null;
+      const daysSinceSale = lastSold ? Math.floor((now - lastSold) / 86400000) : daysActive;
+      if (daysSinceSale >= daysBefore) {
+        const droppedPrice = parseFloat((newPrice - dropAmount).toFixed(2));
+        result.decisions.push('Stale Inventory: ' + daysSinceSale + 'd without sale (threshold ' + daysBefore + 'd) → drop $' + dropAmount.toFixed(2) + ' from $' + newPrice.toFixed(2) + ' to $' + droppedPrice.toFixed(2));
+        newPrice = droppedPrice;
+      } else {
+        result.decisions.push('Stale Inventory: ' + daysSinceSale + 'd without sale (threshold ' + daysBefore + 'd) → not stale yet');
+      }
+    } else {
+      result.decisions.push('Stale Inventory: DISABLED, skipped');
+    }
+
+    // Rule 4: Never Below Cost
+    const r4 = REPRICER_RULES.find(r => r.rule_name === 'Never Below Cost');
+    if (r4 && r4.is_active) {
+      if (newPrice < listing.cost_basis) {
+        result.decisions.push('Never Below Cost: $' + newPrice.toFixed(2) + ' below cost $' + listing.cost_basis.toFixed(2) + ' → floored at cost');
+        newPrice = listing.cost_basis;
+      } else {
+        result.decisions.push('Never Below Cost: $' + newPrice.toFixed(2) + ' above cost $' + listing.cost_basis.toFixed(2) + ' → OK');
+      }
+    } else {
+      result.decisions.push('Never Below Cost: DISABLED, skipped');
+    }
+
+    // Rule 5: Sales Rank Guard
+    const r5 = REPRICER_RULES.find(r => r.rule_name === 'Sales Rank Guard');
+    if (r5 && r5.is_active) {
+      const threshold = parseInt(r5.target_position) || 500000;
+      if (listing.sales_rank > threshold && newPrice < listing.current_price) {
+        result.decisions.push('Sales Rank Guard: rank ' + (listing.sales_rank || 0).toLocaleString() + ' > ' + threshold.toLocaleString() + ' and price dropping → BLOCKED');
+        newPrice = listing.current_price;
+      } else {
+        result.decisions.push('Sales Rank Guard: rank ' + (listing.sales_rank || 0).toLocaleString() + ' vs threshold ' + threshold.toLocaleString() + ' → OK');
+      }
+    } else {
+      result.decisions.push('Sales Rank Guard: DISABLED, skipped');
+    }
+
+    // Final bounds
+    newPrice = Math.max(newPrice, listing.min_price);
+    newPrice = Math.min(newPrice, listing.max_price);
+    newPrice = parseFloat(newPrice.toFixed(2));
+
+    result.new_price = newPrice;
+    result.changed = newPrice !== listing.current_price;
+
+    if (result.changed) {
+      result.decisions.push('FINAL: price changed $' + listing.current_price.toFixed(2) + ' → $' + newPrice.toFixed(2));
+      // Save to log with TEST tag
+      const logEntry = {
+        asin: listing.asin,
+        sku: listing.sku,
+        old_price: listing.current_price,
+        new_price: newPrice,
+        reason: 'TEST: ' + result.decisions.filter(d => !d.includes('no change') && !d.includes('no trigger') && !d.includes('not stale') && !d.includes('OK') && !d.includes('skipped')).join('; '),
+      };
+      await saveLogEntry(logEntry);
+      // Update listing in DB
+      if (listing.id) {
+        await updateListingInDb(listing.id, { current_price: newPrice, last_repriced: now.toISOString() });
+      }
+      listing.current_price = newPrice;
+      listing.last_repriced = now.toISOString();
+    } else {
+      result.decisions.push('FINAL: no price change needed');
+    }
+
+    testResults.push(result);
+  }
+
+  // Reload log
+  const freshLog = await loadRepricingLog();
+  if (Array.isArray(freshLog)) repricerLog = freshLog;
+
+  const section = document.getElementById('repricer-section');
+  section.outerHTML = renderRepricer();
+  switchRepricerTab('test');
+  const newStatus = document.getElementById('test-status');
+  if (newStatus) {
+    const changed = testResults.filter(r => r.changed).length;
+    newStatus.className = changed > 0 ? 'repricer-status success' : 'repricer-status info';
+    newStatus.textContent = 'Test reprice complete: ' + changed + ' of ' + testResults.length + ' listings changed.';
   }
 }
 
