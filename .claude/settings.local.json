@@ -34,7 +34,8 @@
       "Bash(grep -E \"\\\\.\\(json|jsx|js|tsx|ts\\)$\")",
       "Bash(node:*)",
       "Bash(grep -o \"owner\" dist/assets/index-*.js)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(npx supabase:*)"
     ]
   }
 }
