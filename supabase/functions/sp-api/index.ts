@@ -78,8 +78,22 @@ async function spApiRequest(path: string, method = "GET", body?: unknown): Promi
     opts.body = JSON.stringify(body);
   }
 
+  // Debug logging
+  console.log("=== SP-API REQUEST ===");
+  console.log("URL:", url);
+  console.log("Method:", method);
+  console.log("Headers:", JSON.stringify(headers, null, 2));
+  if (opts.body) {
+    console.log("Body:", opts.body);
+  }
+
   const res = await fetch(url, opts);
   const responseBody = await res.text();
+
+  console.log("=== SP-API RESPONSE ===");
+  console.log("Status:", res.status);
+  console.log("Response Headers:", JSON.stringify(Object.fromEntries(res.headers.entries()), null, 2));
+  console.log("Body:", responseBody);
 
   if (!res.ok) {
     return { error: true, status: res.status, message: responseBody };
