@@ -24,7 +24,6 @@ const LWA_TOKEN_URL = "https://api.amazon.com/auth/o2/token";
 // Cache access token in memory (edge functions are short-lived, but avoids
 // re-fetching within the same invocation for multi-action requests)
 let cachedToken: { token: string; expiresAt: number } | null = null;
-let cachedSellerId: string | null = null;
 
 async function getAccessToken(): Promise<string> {
   const now = Date.now();
@@ -107,71 +106,15 @@ async function spApiRequest(path: string, method = "GET", body?: unknown): Promi
   }
 }
 
-/**
- * Dynamically fetch the seller ID from the Sellers API account endpoint.
- * GET /sellers/v1/account returns the selling partner account info
- * including the merchant token (which IS the seller ID).
- * Logs the full raw response for debugging.
- */
-async function getActiveSellerId(): Promise<string> {
-  if (cachedSellerId) return cachedSellerId;
+// Confirmed seller ID for the US marketplace (ATVPDKIKX0DER)
+const CONFIRMED_SELLER_ID = "A1TXEW03NQ1VT4";
 
+function getActiveSellerId(): string {
   const envSellerId = Deno.env.get("SP_API_SELLER_ID") || "";
-
-  console.log("========================================");
-  console.log("=== DISCOVERING SELLER ID via /sellers/v1/account ===");
-  console.log("Env var SP_API_SELLER_ID:", envSellerId);
-  console.log("========================================");
-
-  try {
-    const result = await spApiRequest("/sellers/v1/account");
-
-    console.log("=== FULL /sellers/v1/account RESPONSE ===");
-    console.log(JSON.stringify(result, null, 2));
-    console.log("=== END RESPONSE ===");
-
-    // Walk the entire response looking for any field that could be the seller ID.
-    // Possible field names: merchantToken, sellerId, sellingPartnerId, merchantId, id
-    const resultObj = result as Record<string, unknown>;
-
-    // Check top-level and payload-wrapped responses
-    const searchTargets = [resultObj, resultObj.payload as Record<string, unknown>].filter(Boolean);
-
-    const candidateKeys = ["merchantToken", "sellerId", "sellingPartnerId", "merchantId", "merchant_token", "seller_id"];
-
-    for (const target of searchTargets) {
-      for (const key of candidateKeys) {
-        const val = target[key];
-        if (typeof val === "string" && val.length > 0) {
-          console.log("========================================");
-          console.log(`=== FOUND seller ID from field "${key}":`, val);
-          if (envSellerId && val !== envSellerId) {
-            console.warn("!!! WARNING: Env var SP_API_SELLER_ID=" + envSellerId + " does NOT match discovered ID=" + val);
-          }
-          console.log("========================================");
-          cachedSellerId = val;
-          return val;
-        }
-      }
-
-      // Deep search: walk all string values looking for an Amazon seller ID pattern (starts with A, 13-14 chars)
-      for (const [key, val] of Object.entries(target)) {
-        if (typeof val === "string" && /^A[A-Z0-9]{12,13}$/.test(val) && !candidateKeys.includes(key)) {
-          console.log(`=== POSSIBLE seller ID in field "${key}":`, val);
-        }
-      }
-    }
-
-    console.error("Could not extract seller ID from /sellers/v1/account response.");
-    console.log("Dumping all top-level keys:", Object.keys(resultObj));
-  } catch (err) {
-    console.error("Failed to call /sellers/v1/account:", err);
+  if (envSellerId && envSellerId !== CONFIRMED_SELLER_ID) {
+    console.warn("WARNING: SP_API_SELLER_ID env var (" + envSellerId + ") differs from confirmed seller ID (" + CONFIRMED_SELLER_ID + "). Using confirmed ID.");
   }
-
-  // Last resort: env var
-  console.warn("LAST RESORT: Using env var SP_API_SELLER_ID:", envSellerId);
-  cachedSellerId = envSellerId;
-  return envSellerId;
+  return CONFIRMED_SELLER_ID;
 }
 
 function sleep(ms: number) {
@@ -198,22 +141,35 @@ function parseTsv(tsv: string): Record<string, string>[] {
 
 async function handleFetchListings(): Promise<unknown> {
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
+  const sellerId = getActiveSellerId();
+
+  console.log("========================================");
+  console.log("=== FETCH LISTINGS ===");
+  console.log("Seller ID:", sellerId);
+  console.log("Marketplace:", marketplaceId);
+  console.log("========================================");
 
   // Step 1: Request a GET_MERCHANT_LISTINGS_ALL_DATA report
+  console.log("Step 1: Creating report...");
   const createRes = await spApiRequest("/reports/2021-06-30/reports", "POST", {
     reportType: "GET_MERCHANT_LISTINGS_ALL_DATA",
     marketplaceIds: [marketplaceId],
   }) as Record<string, unknown>;
 
-  if (createRes.error) return createRes;
+  if (createRes.error) {
+    console.error("Report creation failed:", JSON.stringify(createRes));
+    return createRes;
+  }
   const reportId = createRes.reportId as string;
   if (!reportId) return { error: true, message: "No reportId returned", data: createRes };
+  console.log("Report created:", reportId);
 
-  // Step 2: Poll until report is done (max ~60s)
+  // Step 2: Poll until report is done (max ~90s)
   let reportDocId: string | null = null;
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 30; i++) {
     await sleep(3000);
     const status = await spApiRequest(`/reports/2021-06-30/reports/${reportId}`) as Record<string, unknown>;
+    console.log(`Poll ${i + 1}: ${status.processingStatus}`);
     if (status.processingStatus === "DONE") {
       reportDocId = status.reportDocumentId as string;
       break;
@@ -224,8 +180,9 @@ async function handleFetchListings(): Promise<unknown> {
   }
 
   if (!reportDocId) {
-    return { error: true, message: "Report timed out after 60s" };
+    return { error: true, message: "Report timed out after 90s" };
   }
+  console.log("Report document ID:", reportDocId);
 
   // Step 3: Get the report document URL
   const docInfo = await spApiRequest(`/reports/2021-06-30/documents/${reportDocId}`) as Record<string, unknown>;
@@ -235,29 +192,109 @@ async function handleFetchListings(): Promise<unknown> {
   if (!downloadUrl) return { error: true, message: "No download URL in report document", data: docInfo };
 
   // Step 4: Download and parse the TSV report
+  console.log("Downloading report...");
   const dlRes = await fetch(downloadUrl);
   const tsvText = await dlRes.text();
   const rows = parseTsv(tsvText);
 
+  console.log("========================================");
+  console.log("=== REPORT PARSED ===");
+  console.log("Total rows:", rows.length);
+  if (rows.length > 0) {
+    console.log("Column headers:", Object.keys(rows[0]).join(", "));
+    console.log("First row sample:", JSON.stringify(rows[0]));
+  }
+  console.log("========================================");
+
   const skuFilter = /dvdbox|wiibox/i;
 
-  // Normalize to our listing format — only DVDBOX and WIIBOX SKUs
-  const listings = rows
-    .filter((r) => r["status"] === "Active" || r["Status"] === "Active")
+  // Filter to active DVDBOX/WIIBOX listings
+  const filtered = rows
+    .filter((r) => {
+      const st = r["status"] || r["Status"] || "";
+      return st === "Active";
+    })
     .filter((r) => {
       const sku = r["seller-sku"] || r["Seller SKU"] || r["sku"] || "";
       return skuFilter.test(sku);
-    })
-    .map((r) => ({
-      asin: r["asin1"] || r["ASIN1"] || r["asin"] || "",
-      sku: r["seller-sku"] || r["Seller SKU"] || r["sku"] || "",
-      title: r["item-name"] || r["Title"] || r["item-description"] || "",
-      current_price: parseFloat(r["price"] || r["Price"] || "0"),
-      quantity: parseInt(r["quantity"] || r["Quantity"] || "0"),
-      status: "active",
-    }));
+    });
 
-  return { listings, totalRaw: rows.length };
+  console.log("Active DVDBOX/WIIBOX listings:", filtered.length);
+
+  // Build listing objects
+  const listings = filtered.map((r) => ({
+    asin: r["asin1"] || r["ASIN1"] || r["asin"] || "",
+    sku: r["seller-sku"] || r["Seller SKU"] || r["sku"] || "",
+    title: r["item-name"] || r["Title"] || r["item-description"] || "",
+    current_price: parseFloat(r["price"] || r["Price"] || "0"),
+    quantity: parseInt(r["quantity"] || r["Quantity"] || "0"),
+    status: "active",
+    sales_rank: null as number | null,
+  }));
+
+  // Log each listing found
+  for (const l of listings) {
+    console.log(`  [${l.sku}] ${l.asin} — $${l.current_price} — "${l.title.substring(0, 60)}"`);
+  }
+
+  // Step 5: Batch-fetch sales ranks from Catalog Items API (5 at a time to stay under rate limits)
+  const asins = [...new Set(listings.map((l) => l.asin).filter(Boolean))];
+  console.log("========================================");
+  console.log("=== FETCHING SALES RANKS for", asins.length, "ASINs ===");
+  console.log("========================================");
+
+  const salesRankMap: Record<string, number> = {};
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < asins.length; i += BATCH_SIZE) {
+    const batch = asins.slice(i, i + BATCH_SIZE);
+    // Catalog Items API only supports single-ASIN lookups, run in parallel within batch
+    const promises = batch.map(async (asin) => {
+      try {
+        const catRes = await spApiRequest(
+          `/catalog/2022-04-01/items/${asin}?marketplaceIds=${marketplaceId}&includedData=salesRanks`
+        ) as Record<string, unknown>;
+
+        if (catRes && !catRes.error) {
+          const salesRanks = catRes.salesRanks as Array<Record<string, unknown>> | undefined;
+          if (salesRanks && salesRanks.length > 0) {
+            // Find the primary (display group "DVD" or first available) rank
+            const primary = salesRanks[0];
+            const ranks = primary.ranks as Array<{ rank?: number; value?: number }> | undefined;
+            if (ranks && ranks.length > 0) {
+              const rank = ranks[0].rank ?? ranks[0].value;
+              if (typeof rank === "number") {
+                salesRankMap[asin] = rank;
+                console.log(`  Sales rank for ${asin}: #${rank}`);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`  Failed to get sales rank for ${asin}:`, err);
+      }
+    });
+    await Promise.all(promises);
+
+    // Small delay between batches to respect rate limits
+    if (i + BATCH_SIZE < asins.length) {
+      await sleep(500);
+    }
+  }
+
+  // Merge sales ranks into listings
+  for (const listing of listings) {
+    if (listing.asin && salesRankMap[listing.asin] !== undefined) {
+      listing.sales_rank = salesRankMap[listing.asin];
+    }
+  }
+
+  console.log("========================================");
+  console.log("=== SYNC COMPLETE ===");
+  console.log("Listings with sales rank:", listings.filter((l) => l.sales_rank !== null).length);
+  console.log("Total listings returned:", listings.length);
+  console.log("========================================");
+
+  return { listings, totalRaw: rows.length, salesRanksFound: Object.keys(salesRankMap).length };
 }
 
 async function handleGetCompetitivePrice(asin: string): Promise<unknown> {
@@ -289,7 +326,7 @@ async function handleGetCompetitivePriceBatch(asins: string[]): Promise<unknown>
 }
 
 async function handleGetListingInfo(sku: string): Promise<unknown> {
-  const sellerId = await getActiveSellerId();
+  const sellerId = getActiveSellerId();
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
   const encodedSku = encodeURIComponent(sku);
 
@@ -305,7 +342,7 @@ async function handleVerifySeller(): Promise<unknown> {
 }
 
 async function handleUpdatePrice(sku: string, price: number): Promise<unknown> {
-  const sellerId = await getActiveSellerId();
+  const sellerId = getActiveSellerId();
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
   const encodedSku = encodeURIComponent(sku);
   const priceStr = price.toFixed(2);

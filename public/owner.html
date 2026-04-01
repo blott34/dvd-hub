@@ -1229,13 +1229,16 @@ async function handleSyncFromAmazon() {
       if (!al.sku || !al.asin) continue;
       if (!skuSyncFilter.test(al.sku)) continue;
       const existing = repricerListings.find(l => l.sku === al.sku);
-      if (existing) {
-        // Update price and title from Amazon, keep local min/max/cost_basis
-        await updateListingInDb(existing.id, {
+      const updateFields = {
           current_price: al.current_price,
           title: al.title,
           asin: al.asin,
-        });
+        };
+      if (al.sales_rank != null) updateFields.sales_rank = al.sales_rank;
+
+      if (existing) {
+        // Update price, title, sales_rank from Amazon, keep local min/max/cost_basis
+        await updateListingInDb(existing.id, updateFields);
       } else {
         // Insert new listing
         await fetch(`${SUPABASE_URL}/rest/v1/listings`, {
@@ -1254,6 +1257,7 @@ async function handleSyncFromAmazon() {
             min_price: 8.50,
             max_price: 24.99,
             cost_basis: 0,
+            sales_rank: al.sales_rank || null,
             status: 'active',
           }),
         });
