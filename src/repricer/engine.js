@@ -29,8 +29,11 @@ export function runRepricingEngine(listings, rules) {
     ruleMap[r.rule_name] = r;
   }
 
+  const skuFilter = /dvdbox|wiibox/i;
+
   for (const listing of listings) {
     if (listing.status !== 'active') continue;
+    if (!skuFilter.test(listing.sku)) continue;
 
     let newPrice = listing.current_price;
     let reason = null;

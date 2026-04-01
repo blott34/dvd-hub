@@ -760,8 +760,11 @@ function runRepricerEngine() {
   const now = new Date();
   const newLogEntries = [];
 
+  const skuFilter = /dvdbox|wiibox/i;
+
   for (const listing of repricerListings) {
     if (listing.status !== 'active') continue;
+    if (!skuFilter.test(listing.sku)) continue;
 
     let newPrice = listing.current_price;
     let reason = null;
@@ -945,6 +948,7 @@ function renderRepricer() {
 
       <!-- RULES TAB -->
       <div class="repricer-tab" id="repricer-rules">
+        <div style="padding:10px 16px;margin-bottom:14px;background:#1a1500;border:1px solid #4a3a00;border-radius:8px;font-size:13px;color:#ffcc00;">Only repricing SKUs containing DVDBOX or WIIBOX — all other listings are ignored.</div>
         <div class="rules-list">
           ${REPRICER_RULES.map((rule, i) => `
             <div class="rule-card">
@@ -1096,8 +1100,10 @@ async function handleSyncFromAmazon() {
     if (status) { status.textContent = 'Got ' + amazonListings.length + ' active listings from Amazon. Syncing to database...'; }
 
     // Upsert each listing into Supabase (merge with existing data)
+    const skuSyncFilter = /dvdbox|wiibox/i;
     for (const al of amazonListings) {
       if (!al.sku || !al.asin) continue;
+      if (!skuSyncFilter.test(al.sku)) continue;
       const existing = repricerListings.find(l => l.sku === al.sku);
       if (existing) {
         // Update price and title from Amazon, keep local min/max/cost_basis

@@ -157,9 +157,15 @@ async function handleFetchListings(): Promise<unknown> {
   const tsvText = await dlRes.text();
   const rows = parseTsv(tsvText);
 
-  // Normalize to our listing format
+  const skuFilter = /dvdbox|wiibox/i;
+
+  // Normalize to our listing format — only DVDBOX and WIIBOX SKUs
   const listings = rows
     .filter((r) => r["status"] === "Active" || r["Status"] === "Active")
+    .filter((r) => {
+      const sku = r["seller-sku"] || r["Seller SKU"] || r["sku"] || "";
+      return skuFilter.test(sku);
+    })
     .map((r) => ({
       asin: r["asin1"] || r["ASIN1"] || r["asin"] || "",
       sku: r["seller-sku"] || r["Seller SKU"] || r["sku"] || "",

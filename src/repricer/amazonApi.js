@@ -32,11 +32,18 @@ async function callSpApi(action, params = {}) {
   return data;
 }
 
+const SKU_FILTER = /dvdbox|wiibox/i;
+
 /**
  * Fetch all active listings from Amazon via Listings Items API
+ * Filters to only DVDBOX and WIIBOX SKUs
  */
 export async function fetchListings() {
-  return await callSpApi('fetchListings');
+  const result = await callSpApi('fetchListings');
+  if (result.listings) {
+    result.listings = result.listings.filter(l => SKU_FILTER.test(l.sku));
+  }
+  return result;
 }
 
 /**
