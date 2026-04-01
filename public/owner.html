@@ -707,7 +707,7 @@ async function callSpApi(action, params = {}) {
 
 // Load listings from Supabase listings table (local data with min/max/cost_basis)
 async function loadListingsFromDb() {
-  return await query('listings', 'select=*&status=eq.active&order=sku.asc');
+  return await query('listings', 'select=*&status=eq.active&or=(sku.ilike.*dvdbox*,sku.ilike.*wiibox*)&order=sku.asc');
 }
 
 // Load repricing log from Supabase

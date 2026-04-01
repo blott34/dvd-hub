@@ -284,17 +284,16 @@ async function runAutoReprice() {
   console.log("Auto-reprice run started:", runId);
 
   try {
-    // Step 1: Load active listings from Supabase
+    // Step 1: Load active DVDBOX/WIIBOX listings from Supabase
     const { data: listings, error: listErr } = await sb
       .from("listings")
       .select("*")
-      .eq("status", "active");
+      .eq("status", "active")
+      .or("sku.ilike.%dvdbox%,sku.ilike.%wiibox%");
 
     if (listErr) throw new Error("Failed to load listings: " + listErr.message);
 
-    const activeListings = (listings || []).filter(
-      (l: Listing) => SKU_FILTER.test(l.sku)
-    ) as Listing[];
+    const activeListings = (listings || []) as Listing[];
 
     console.log("Active DVDBOX/WIIBOX listings:", activeListings.length);
 
