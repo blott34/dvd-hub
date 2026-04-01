@@ -545,6 +545,52 @@
     .rule-card { flex-direction: column; }
   }
 
+  /* Auto-reprice section */
+  .auto-reprice-bar {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    padding: 16px 20px;
+    background: #111111;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+
+  .auto-reprice-bar .toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 600;
+    font-size: 14px;
+    color: #fff;
+  }
+
+  .auto-reprice-stats {
+    display: flex;
+    gap: 24px;
+    flex: 1;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+
+  .auto-reprice-stat {
+    text-align: center;
+  }
+
+  .auto-reprice-stat .ar-val {
+    font-size: 16px;
+    font-weight: 700;
+    color: #fff;
+  }
+
+  .auto-reprice-stat .ar-lbl {
+    font-size: 11px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
   .loading-screen {
     display: flex;
     align-items: center;
@@ -674,6 +720,29 @@ async function loadRepricingRules() {
   return await query('repricing_rules', 'select=*&order=id.asc');
 }
 
+// Load auto-reprice settings
+async function loadAutoRepriceSettings() {
+  return await query('auto_reprice_settings', 'select=*&id=eq.1');
+}
+
+// Load latest reprice run
+async function loadLatestRepriceRun() {
+  return await query('reprice_runs', 'select=*&order=started_at.desc&limit=1');
+}
+
+// Toggle auto-reprice enabled/disabled
+async function setAutoRepriceEnabled(enabled) {
+  await fetch(`${SUPABASE_URL}/rest/v1/auto_reprice_settings?id=eq.1`, {
+    method: 'PATCH',
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ enabled, updated_at: new Date().toISOString() }),
+  });
+}
+
 // Save a repricing log entry to Supabase
 async function saveLogEntry(entry) {
   await fetch(`${SUPABASE_URL}/rest/v1/repricing_log`, {
@@ -717,6 +786,8 @@ let repricerListings = [];
 let repricerLog = [];
 let repricerDataSource = 'db'; // 'db' or 'mock'
 let repricerLoading = false;
+let autoRepriceEnabled = true;
+let lastRepriceRun = null;
 
 // ===== TEST MODE =====
 const TEST_SKUS = ['DVDBOX-1.05-01352', 'DVDBOX-1.05-01347', 'DVDBOX-1.05-01364'];
@@ -736,10 +807,12 @@ let REPRICER_RULES = [
 async function initRepricerData() {
   try {
     // Try loading from Supabase tables
-    const [dbListings, dbLog, dbRules] = await Promise.all([
+    const [dbListings, dbLog, dbRules, arSettings, arRun] = await Promise.all([
       loadListingsFromDb(),
       loadRepricingLog(),
       loadRepricingRules(),
+      loadAutoRepriceSettings(),
+      loadLatestRepriceRun(),
     ]);
 
     if (Array.isArray(dbListings) && dbListings.length > 0) {
@@ -755,6 +828,14 @@ async function initRepricerData() {
 
     if (Array.isArray(dbRules) && dbRules.length > 0) {
       REPRICER_RULES = dbRules;
+    }
+
+    if (Array.isArray(arSettings) && arSettings.length > 0) {
+      autoRepriceEnabled = arSettings[0].enabled;
+    }
+
+    if (Array.isArray(arRun) && arRun.length > 0) {
+      lastRepriceRun = arRun[0];
     }
   } catch (e) {
     console.warn('Repricer DB load failed, using defaults:', e);
@@ -917,6 +998,40 @@ function renderRepricer() {
   return `
     <section class="section" id="repricer-section">
       <h2>Repricer</h2>
+
+      <!-- Auto-Reprice Bar -->
+      <div class="auto-reprice-bar">
+        <div class="toggle-label">
+          <label class="toggle-switch">
+            <input type="checkbox" ${autoRepriceEnabled ? 'checked' : ''} onchange="handleAutoRepriceToggle(this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+          <span>Auto Reprice</span>
+          <span style="font-weight:400;font-size:12px;color:${autoRepriceEnabled ? '#22ff55' : '#ff4444'};">${autoRepriceEnabled ? 'ACTIVE — every 15 min' : 'PAUSED'}</span>
+        </div>
+        <div class="auto-reprice-stats">
+          ${lastRepriceRun ? `
+            <div class="auto-reprice-stat">
+              <div class="ar-val">${new Date(lastRepriceRun.started_at).toLocaleString()}</div>
+              <div class="ar-lbl">Last Run</div>
+            </div>
+            <div class="auto-reprice-stat">
+              <div class="ar-val">${lastRepriceRun.listings_checked || 0}</div>
+              <div class="ar-lbl">Checked</div>
+            </div>
+            <div class="auto-reprice-stat">
+              <div class="ar-val">${lastRepriceRun.prices_changed || 0}</div>
+              <div class="ar-lbl">Changed</div>
+            </div>
+            <div class="auto-reprice-stat">
+              <div class="ar-val" style="color:${lastRepriceRun.status === 'complete' ? '#22ff55' : lastRepriceRun.status === 'running' ? '#44aaff' : '#ff4444'};">${lastRepriceRun.status === 'complete' ? 'OK' : lastRepriceRun.status === 'running' ? 'RUNNING' : 'FAILED'}</div>
+              <div class="ar-lbl">Status</div>
+            </div>
+            ${lastRepriceRun.error_message ? '<div class="auto-reprice-stat" style="max-width:300px;"><div class="ar-val" style="font-size:11px;color:#ff4444;word-break:break-all;">' + esc(lastRepriceRun.error_message.substring(0, 120)) + '</div><div class="ar-lbl">Error</div></div>' : ''}
+          ` : '<div class="auto-reprice-stat"><div class="ar-val" style="color:#666;">No runs yet</div><div class="ar-lbl">Last Auto Reprice</div></div>'}
+        </div>
+      </div>
+
       <div class="repricer-nav">
         <button onclick="switchRepricerTab('test')" style="color:#ffcc00;border-bottom-color:#ffcc00;" class="active">Test Mode</button>
         <button onclick="switchRepricerTab('overview')">Overview</button>
@@ -1156,6 +1271,13 @@ function updateRuleField(index, field, value) {
   if (REPRICER_RULES[index].id) {
     updateRuleInDb(REPRICER_RULES[index].id, { [field]: parsed });
   }
+}
+
+async function handleAutoRepriceToggle(enabled) {
+  autoRepriceEnabled = enabled;
+  await setAutoRepriceEnabled(enabled);
+  const section = document.getElementById('repricer-section');
+  section.outerHTML = renderRepricer();
 }
 
 async function handleRunRepricer() {
