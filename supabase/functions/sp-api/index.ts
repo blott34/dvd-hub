@@ -109,8 +109,8 @@ async function spApiRequest(path: string, method = "GET", body?: unknown): Promi
 
 /**
  * Dynamically fetch the seller ID from Amazon's Marketplace Participations API.
- * Falls back to SP_API_SELLER_ID env var if the API call fails.
- * Caches the result for the lifetime of this edge function invocation.
+ * Logs the full raw response for debugging, then extracts the seller ID
+ * for the target marketplace. Falls back to env var ONLY if API call fails entirely.
  */
 async function getActiveSellerId(): Promise<string> {
   if (cachedSellerId) return cachedSellerId;
@@ -118,33 +118,93 @@ async function getActiveSellerId(): Promise<string> {
   const envSellerId = Deno.env.get("SP_API_SELLER_ID") || "";
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
 
+  console.log("========================================");
+  console.log("=== DISCOVERING SELLER ID ===");
+  console.log("Target marketplace:", marketplaceId);
+  console.log("Env var SP_API_SELLER_ID:", envSellerId);
+  console.log("========================================");
+
   try {
-    const result = await spApiRequest("/sellers/v1/marketplaceParticipations") as { payload?: Array<{ marketplace?: { id?: string }; participation?: { sellerId?: string } }> };
+    const result = await spApiRequest("/sellers/v1/marketplaceParticipations");
 
-    if (result && Array.isArray(result.payload)) {
-      // Find the participation matching our target marketplace
-      const match = result.payload.find(
-        (p) => p.marketplace?.id === marketplaceId
-      );
-      const dynamicId = match?.participation?.sellerId;
+    console.log("=== FULL MARKETPLACE PARTICIPATIONS RESPONSE ===");
+    console.log(JSON.stringify(result, null, 2));
+    console.log("=== END RESPONSE ===");
 
-      if (dynamicId) {
-        console.log("=== SELLER ID ===");
-        console.log("Dynamic (from API):", dynamicId);
-        console.log("Env var:", envSellerId);
-        if (envSellerId && dynamicId !== envSellerId) {
-          console.warn("WARNING: SP_API_SELLER_ID env var does NOT match API-returned seller ID!");
+    // The response could be structured in multiple ways depending on API version:
+    // Option A: { payload: [ { marketplace: { id }, participation: { sellerId } } ] }
+    // Option B: Direct array at top level
+    // Option C: Nested differently
+    // We search all possible paths for the seller ID.
+
+    const resultObj = result as Record<string, unknown>;
+
+    // Try to get the array of participations
+    let participations: unknown[] | null = null;
+    if (Array.isArray(resultObj.payload)) {
+      participations = resultObj.payload;
+    } else if (Array.isArray(result)) {
+      participations = result as unknown[];
+    }
+
+    if (participations) {
+      console.log("Found", participations.length, "marketplace participation(s)");
+
+      // Search every participation for our target marketplace
+      for (const entry of participations) {
+        const e = entry as Record<string, unknown>;
+        console.log("--- Participation entry ---");
+        console.log(JSON.stringify(e, null, 2));
+
+        // Extract marketplace ID — could be at multiple paths
+        const mkt = e.marketplace as Record<string, unknown> | undefined;
+        const mktId = mkt?.id as string | undefined;
+
+        // Extract seller ID — could be at multiple paths
+        const participation = e.participation as Record<string, unknown> | undefined;
+        let foundSellerId = participation?.sellerId as string | undefined;
+
+        // Some responses put sellerId directly on the entry
+        if (!foundSellerId) {
+          foundSellerId = e.sellerId as string | undefined;
         }
-        cachedSellerId = dynamicId;
-        return dynamicId;
+
+        console.log("  marketplace.id:", mktId);
+        console.log("  sellerId:", foundSellerId);
+
+        if (mktId === marketplaceId && foundSellerId) {
+          console.log("========================================");
+          console.log("=== MATCHED! Using seller ID:", foundSellerId);
+          if (envSellerId && foundSellerId !== envSellerId) {
+            console.warn("!!! WARNING: Env var SP_API_SELLER_ID=" + envSellerId + " does NOT match discovered seller ID=" + foundSellerId);
+          }
+          console.log("========================================");
+          cachedSellerId = foundSellerId;
+          return foundSellerId;
+        }
+      }
+
+      // If we didn't find an exact marketplace match, grab the first sellerId we can find
+      console.log("No exact marketplace match found. Checking first available seller ID...");
+      for (const entry of participations) {
+        const e = entry as Record<string, unknown>;
+        const participation = e.participation as Record<string, unknown> | undefined;
+        const fallbackId = (participation?.sellerId || e.sellerId) as string | undefined;
+        if (fallbackId) {
+          console.log("Using first available seller ID:", fallbackId);
+          cachedSellerId = fallbackId;
+          return fallbackId;
+        }
       }
     }
+
+    console.error("Could not extract seller ID from marketplace participations response!");
   } catch (err) {
-    console.error("Failed to fetch seller ID dynamically:", err);
+    console.error("Failed to call marketplace participations API:", err);
   }
 
-  // Fallback to env var
-  console.log("Using SP_API_SELLER_ID env var as fallback:", envSellerId);
+  // Last resort: env var
+  console.warn("LAST RESORT: Using env var SP_API_SELLER_ID:", envSellerId);
   cachedSellerId = envSellerId;
   return envSellerId;
 }
