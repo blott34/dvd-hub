@@ -930,6 +930,7 @@ function renderRepricer() {
         <div style="padding:10px 16px;margin-bottom:14px;background:#1a1500;border:1px solid #4a3a00;border-radius:8px;font-size:13px;color:#ffcc00;">Test Mode — Only these 3 SKUs: ${TEST_SKUS.join(', ')}</div>
         <div class="repricer-actions" style="margin-bottom:12px;">
           <button class="btn-reprice primary" id="btn-test-reprice" onclick="handleRunTestReprice()">Run Test Reprice</button>
+          ${testResults.some(r => r.changed) ? '<button class="btn-reprice secondary" id="btn-push-amazon" onclick="handlePushToAmazon()" style="background:#ff6600;color:#fff;">Push Changes to Amazon</button>' : ''}
         </div>
         <div class="repricer-status" id="test-status"></div>
         ${(() => {
@@ -1487,6 +1488,51 @@ async function handleRunTestReprice() {
     const changed = testResults.filter(r => r.changed).length;
     newStatus.className = changed > 0 ? 'repricer-status success' : 'repricer-status info';
     newStatus.textContent = 'Test reprice complete: ' + changed + ' of ' + testResults.length + ' listings changed.';
+  }
+}
+
+async function handlePushToAmazon() {
+  const changed = testResults.filter(r => r.changed);
+  if (changed.length === 0) return;
+
+  const btn = document.getElementById('btn-push-amazon');
+  if (btn) { btn.disabled = true; btn.textContent = 'Pushing to Amazon...'; }
+  const statusEl = document.getElementById('test-status');
+
+  const pushResults = [];
+
+  for (const r of changed) {
+    try {
+      if (statusEl) { statusEl.className = 'repricer-status info'; statusEl.textContent = 'Updating ' + r.sku + ' to $' + r.new_price.toFixed(2) + '...'; }
+      const res = await callSpApi('updatePrice', { sku: r.sku, price: r.new_price });
+      const hasError = res.error || (res.status && res.status === 'INVALID');
+      pushResults.push({ sku: r.sku, price: r.new_price, success: !hasError, detail: hasError ? JSON.stringify(res) : 'OK' });
+    } catch (e) {
+      pushResults.push({ sku: r.sku, price: r.new_price, success: false, detail: e.message });
+    }
+  }
+
+  // Re-render and show results
+  const section = document.getElementById('repricer-section');
+  section.outerHTML = renderRepricer();
+  switchRepricerTab('test');
+
+  const newStatus = document.getElementById('test-status');
+  if (newStatus) {
+    const ok = pushResults.filter(p => p.success).length;
+    const fail = pushResults.filter(p => !p.success).length;
+    newStatus.className = fail > 0 ? 'repricer-status' : 'repricer-status success';
+    if (fail > 0) { newStatus.style.display = 'block'; newStatus.style.background = '#2a1a0a'; newStatus.style.color = '#ffaa00'; newStatus.style.borderColor = '#4a3a1a'; }
+    newStatus.innerHTML = '<div style="margin-bottom:8px;font-weight:700;">Amazon Push Results: ' + ok + ' sent' + (fail > 0 ? ', ' + fail + ' failed' : '') + '</div>' +
+      pushResults.map(p =>
+        '<div style="padding:4px 0;display:flex;gap:12px;align-items:center;">' +
+          '<span style="font-weight:600;width:180px;">' + esc(p.sku) + '</span>' +
+          '<span style="width:80px;">$' + p.price.toFixed(2) + '</span>' +
+          (p.success
+            ? '<span style="color:#22ff55;font-weight:600;">Sent</span>'
+            : '<span style="color:#ff4444;">Failed: ' + esc(p.detail) + '</span>') +
+        '</div>'
+      ).join('');
   }
 }
 
