@@ -285,27 +285,45 @@ async function handleUpdatePrice(sku: string, price: number): Promise<unknown> {
   const encodedSku = encodeURIComponent(sku);
   const priceStr = price.toFixed(2);
 
-  // Step 1: GET the listing to discover the real productType and confirm seller ID
-  console.log("=== FETCHING LISTING INFO FOR PRODUCT TYPE ===");
-  console.log("Using dynamic seller ID:", sellerId);
-  const listingInfo = await spApiRequest(
-    `/listings/2021-08-01/items/${sellerId}/${encodedSku}?marketplaceIds=${marketplaceId}&includedData=summaries,attributes&issueLocale=en_US`
-  ) as Record<string, unknown>;
+  // Step 1: GET full listing info via the same handler used by getListingInfo action
+  console.log("========================================");
+  console.log("=== STEP 1: FETCH LISTING INFO ===");
+  console.log("SKU:", sku);
+  console.log("Seller ID:", sellerId);
+  console.log("Marketplace:", marketplaceId);
+  console.log("========================================");
 
-  let productType = "PRODUCT"; // fallback
+  const listingInfo = await handleGetListingInfo(sku) as Record<string, unknown>;
+
+  console.log("=== FULL LISTING INFO RESPONSE ===");
+  console.log(JSON.stringify(listingInfo, null, 2));
+
+  // Extract productType from summaries
+  let productType: string | null = null;
   if (listingInfo && !listingInfo.error) {
-    // productType is in summaries[0].productType
     const summaries = listingInfo.summaries as Array<Record<string, unknown>> | undefined;
     if (summaries && summaries.length > 0 && summaries[0].productType) {
       productType = summaries[0].productType as string;
     }
-    console.log("Discovered productType:", productType);
-  } else {
-    console.log("Could not fetch listing info, using fallback productType:", productType);
-    console.log("Listing info response:", JSON.stringify(listingInfo));
   }
 
-  // Step 2: PATCH with the correct productType
+  console.log("========================================");
+  console.log("=== EXTRACTED productType:", productType ?? "NOT FOUND");
+  console.log("========================================");
+
+  if (!productType) {
+    return {
+      method: "PATCH",
+      error: true,
+      message: "Could not determine productType from listing info. Cannot proceed with PATCH.",
+      listingInfo,
+      sellerId,
+      sku,
+    };
+  }
+
+  // Step 2: Build and send PATCH request
+  const patchUrl = `${SP_API_BASE}/listings/2021-08-01/items/${sellerId}/${encodedSku}?marketplaceIds=${marketplaceId}&issueLocale=en_US`;
   const patchBody = {
     productType,
     patches: [
@@ -331,16 +349,26 @@ async function handleUpdatePrice(sku: string, price: number): Promise<unknown> {
     ],
   };
 
-  console.log("=== PATCH REQUEST ===");
-  console.log("productType:", productType);
+  console.log("========================================");
+  console.log("=== STEP 2: PATCH PRICE UPDATE ===");
+  console.log("URL:", patchUrl);
+  console.log("Method: PATCH");
+  console.log("Seller ID:", sellerId);
   console.log("SKU:", sku, "→ encoded:", encodedSku);
+  console.log("productType:", productType);
   console.log("Price:", priceStr);
+  console.log("=== FULL PATCH BODY ===");
+  console.log(JSON.stringify(patchBody, null, 2));
+  console.log("========================================");
 
   const patchResult = await spApiRequest(
     `/listings/2021-08-01/items/${sellerId}/${encodedSku}?marketplaceIds=${marketplaceId}&issueLocale=en_US`,
     "PATCH",
     patchBody
   ) as Record<string, unknown>;
+
+  console.log("=== PATCH RESPONSE ===");
+  console.log(JSON.stringify(patchResult, null, 2));
 
   // If PATCH succeeded, return it
   if (!patchResult.error) {
