@@ -409,34 +409,42 @@
     border-radius: 8px;
     padding: 20px 24px;
     display: flex;
-    align-items: flex-start;
-    gap: 20px;
+    flex-direction: row;
+    align-items: center;
+    gap: 0;
   }
 
   .rule-toggle {
-    flex-shrink: 0;
-    padding-top: 2px;
+    flex: 0 0 44px;
+    width: 44px;
+    height: 24px;
+    margin-right: 20px;
   }
 
   .toggle-switch {
+    display: block;
     position: relative;
     width: 44px;
     height: 24px;
+    cursor: pointer;
   }
 
   .toggle-switch input {
+    position: absolute;
     opacity: 0;
     width: 0;
     height: 0;
+    pointer-events: none;
   }
 
   .toggle-slider {
-    position: absolute;
-    cursor: pointer;
-    top: 0; left: 0; right: 0; bottom: 0;
+    display: block;
+    width: 44px;
+    height: 24px;
     background: #2a2a2a;
     border-radius: 24px;
     transition: 0.2s;
+    position: relative;
   }
 
   .toggle-slider:before {
@@ -445,7 +453,7 @@
     height: 18px;
     width: 18px;
     left: 3px;
-    bottom: 3px;
+    top: 3px;
     background: #555;
     border-radius: 50%;
     transition: 0.2s;
@@ -463,7 +471,7 @@
 
   .rule-info { flex: 1; min-width: 0; }
   .rule-name { font-weight: 600; font-size: 15px; color: #fff; margin-bottom: 4px; }
-  .rule-desc { font-size: 13px; color: #888; margin-bottom: 8px; }
+  .rule-desc { font-size: 13px; color: #888; margin-bottom: 8px; word-wrap: break-word; }
 
   .rule-fields {
     display: flex;
