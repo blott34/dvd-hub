@@ -1122,16 +1122,29 @@ function renderRepricer() {
         </div>
         <div class="repricer-actions">
           <button class="btn-reprice primary" onclick="handleRunRepricer()">Run Repricing Engine</button>
-          <button class="btn-reprice secondary" id="btn-sync-amazon" onclick="handleSyncFromAmazon()">Sync from Amazon</button>
+          <button class="btn-reprice secondary" id="btn-sync-amazon" onclick="handleSyncFromAmazon()">Refresh Prices</button>
           <button class="btn-reprice secondary" onclick="handleRefreshFromDb()">Refresh from DB</button>
           <span style="font-size:12px;color:#666;align-self:center;margin-left:8px;">
-            Source: ${repricerDataSource === 'db' ? '<span style="color:#22ff55;">Supabase DB</span> (' + repricerListings.length + ' listings)' : '<span style="color:#ffaa00;">No listings in DB yet</span> — click Sync from Amazon'}
+            Source: ${repricerDataSource === 'db' ? '<span style="color:#22ff55;">Supabase DB</span> (' + repricerListings.length + ' listings)' : '<span style="color:#ffaa00;">No listings in DB yet</span> — use Import SKUs below'}
           </span>
         </div>
         <div class="repricer-status" id="repricer-status"></div>
+
+        <!-- Import SKUs Section -->
+        <div style="margin-top:20px;padding:20px;background:#111;border-radius:8px;border:1px solid #2a2a2a;">
+          <h3 style="font-size:13px;color:#fff;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Import SKUs</h3>
+          <p style="font-size:12px;color:#888;margin-bottom:12px;">Paste DVDBOX/WIIBOX SKUs (one per line). Each SKU will be looked up on Amazon to get ASIN, title, price, and sales rank.</p>
+          <textarea id="import-skus-input" rows="6" style="width:100%;background:#0a0a0a;border:1px solid #333;border-radius:6px;color:#e2e8f0;font-family:monospace;font-size:13px;padding:10px;resize:vertical;" placeholder="DVDBOX-1.05-01352&#10;DVDBOX-1.05-01347&#10;WIIBOX-2.00-00123"></textarea>
+          <div style="display:flex;gap:12px;margin-top:10px;align-items:center;">
+            <button class="btn-reprice primary" id="btn-import-skus" onclick="handleImportSkus()">Import SKUs</button>
+            <span id="import-sku-count" style="font-size:12px;color:#666;"></span>
+          </div>
+          <div class="repricer-status" id="import-status" style="margin-top:10px;"></div>
+        </div>
+
         <!-- Quick log preview -->
         ${repricerLog.length > 0 ? `
-          <h3 style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;margin-top:8px;">Recent Changes</h3>
+          <h3 style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;margin-top:20px;">Recent Changes</h3>
           <div class="table-wrap"><table>
             <thead><tr><th>Time</th><th>SKU</th><th>Old</th><th>New</th><th>Reason</th></tr></thead>
             <tbody>${repricerLog.slice(0, 5).map(e => `
@@ -1278,6 +1291,82 @@ async function handleAutoRepriceToggle(enabled) {
   await setAutoRepriceEnabled(enabled);
   const section = document.getElementById('repricer-section');
   section.outerHTML = renderRepricer();
+}
+
+async function handleImportSkus() {
+  const input = document.getElementById('import-skus-input');
+  const btn = document.getElementById('btn-import-skus');
+  const statusEl = document.getElementById('import-status');
+  if (!input) return;
+
+  const raw = input.value.trim();
+  if (!raw) { if (statusEl) { statusEl.className = 'repricer-status info'; statusEl.textContent = 'Paste SKUs first.'; } return; }
+
+  const skuFilter = /dvdbox|wiibox/i;
+  const skus = raw.split('\n').map(s => s.trim()).filter(s => s.length > 0 && skuFilter.test(s));
+
+  if (skus.length === 0) {
+    if (statusEl) { statusEl.className = 'repricer-status'; statusEl.style.display = 'block'; statusEl.style.background = '#2a0a0a'; statusEl.style.color = '#ff4444'; statusEl.style.borderColor = '#4a1a1a'; statusEl.textContent = 'No valid DVDBOX/WIIBOX SKUs found.'; }
+    return;
+  }
+
+  if (btn) { btn.disabled = true; btn.textContent = 'Importing ' + skus.length + ' SKUs...'; }
+  if (statusEl) { statusEl.className = 'repricer-status info'; statusEl.textContent = 'Starting import of ' + skus.length + ' SKUs...'; }
+
+  try {
+    const result = await callSpApi('importSkus', { skus });
+
+    if (result.error) {
+      if (statusEl) { statusEl.style.background = '#2a0a0a'; statusEl.style.color = '#ff4444'; statusEl.style.borderColor = '#4a1a1a'; statusEl.textContent = 'Import failed: ' + (result.message || JSON.stringify(result)); }
+      if (btn) { btn.disabled = false; btn.textContent = 'Import SKUs'; }
+      return;
+    }
+
+    const jobId = result.jobId;
+    if (statusEl) { statusEl.textContent = 'Import job started. Looking up SKUs on Amazon...'; }
+
+    // Poll for progress
+    const pollImport = setInterval(async () => {
+      try {
+        const s = await callSpApi('getSyncStatus', { jobId });
+        if (s.error) return;
+
+        const elapsed = Math.round((Date.now() - new Date(s.started_at).getTime()) / 1000);
+
+        if (s.status === 'running') {
+          let msg = 'Importing... (' + elapsed + 's)';
+          if (s.listings_synced > 0) msg = 'Found ' + s.listings_synced + ' listings, fetching prices... (' + elapsed + 's)';
+          else if (s.total_raw > 0) msg = 'Looking up ' + s.total_raw + ' SKUs on Amazon... (' + elapsed + 's)';
+          if (s.prices_fetched > 0) msg = 'Prices: ' + s.prices_fetched + ', ranks: ' + (s.ranks_fetched || 0) + ' (' + elapsed + 's)';
+          if (statusEl) { statusEl.className = 'repricer-status info'; statusEl.textContent = msg; }
+          return;
+        }
+
+        // Done
+        clearInterval(pollImport);
+        if (s.status === 'complete') {
+          if (statusEl) { statusEl.className = 'repricer-status success'; statusEl.textContent = 'Import complete: ' + s.listings_synced + ' listings imported, ' + (s.prices_fetched || 0) + ' prices, ' + (s.ranks_fetched || 0) + ' ranks (' + elapsed + 's)'; }
+          await initRepricerData();
+          const section = document.getElementById('repricer-section');
+          if (section) {
+            section.outerHTML = renderRepricer();
+            switchRepricerTab('overview');
+            const newStatus = document.getElementById('import-status');
+            if (newStatus) { newStatus.className = 'repricer-status success'; newStatus.textContent = 'Import complete: ' + s.listings_synced + ' listings imported (' + elapsed + 's)'; }
+          }
+        } else {
+          if (statusEl) { statusEl.style.background = '#2a0a0a'; statusEl.style.color = '#ff4444'; statusEl.style.borderColor = '#4a1a1a'; statusEl.style.display = 'block'; statusEl.textContent = 'Import failed: ' + (s.error_message || 'Unknown error'); }
+        }
+        if (btn) { btn.disabled = false; btn.textContent = 'Import SKUs'; }
+      } catch (e) {
+        console.warn('Import poll error:', e);
+      }
+    }, 3000);
+
+  } catch (e) {
+    if (statusEl) { statusEl.style.background = '#2a0a0a'; statusEl.style.color = '#ff4444'; statusEl.style.borderColor = '#4a1a1a'; statusEl.style.display = 'block'; statusEl.textContent = 'Import error: ' + e.message; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Import SKUs'; }
+  }
 }
 
 async function handleRunRepricer() {

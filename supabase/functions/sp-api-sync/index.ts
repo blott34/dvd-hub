@@ -1,11 +1,10 @@
 // Supabase Edge Function: sp-api-sync
-// Fast sync using FBA Inventory Summaries API (no Reports API).
-// Fetches all active inventory, filters to DVDBOX/WIIBOX, then batch-fetches
-// live prices and sales ranks. Progressive upsert — partial results are saved
-// as they come in so even a timeout yields useful data.
+// SKU-based sync — accepts a list of SKUs, looks up each via Listings Items API
+// and Pricing API, then upserts into the listings table.
+// Processes in batches of 10 with progress tracking.
 //
-// Target: complete within 60 seconds.
 // Called by the sp-api function's "startSync" action.
+// Can also be called directly with a list of SKUs for manual import.
 // Progress is tracked in the sync_status table.
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
@@ -15,9 +14,6 @@ const SP_API_BASE = "https://sellingpartnerapi-na.amazon.com";
 const LWA_TOKEN_URL = "https://api.amazon.com/auth/o2/token";
 const CONFIRMED_SELLER_ID = "A1TXEW03NQ1VT4";
 const SKU_FILTER = /dvdbox|wiibox/i;
-
-// Hard timeout — stop fetching after this many ms to leave time for final upsert
-const SYNC_DEADLINE_MS = 55_000;
 
 let cachedToken: { token: string; expiresAt: number } | null = null;
 
@@ -84,25 +80,19 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isOverDeadline(startTime: number): boolean {
-  return Date.now() - startTime > SYNC_DEADLINE_MS;
-}
-
 // ---- Main sync logic ----
 
-interface InventoryListing {
+interface SyncedListing {
   asin: string;
   sku: string;
   title: string;
   current_price: number;
   sales_rank: number | null;
-  quantity: number;
 }
 
-async function runSync(jobId: string) {
+async function runSync(jobId: string, skus?: string[]) {
   const sb = getSupabaseAdmin();
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
-  const startTime = Date.now();
 
   const appendLog = async (msg: string) => {
     console.log(msg);
@@ -114,129 +104,132 @@ async function runSync(jobId: string) {
   };
 
   try {
-    await appendLog("Starting fast sync (Inventory Summaries API)");
+    // Determine which SKUs to sync
+    let skusToSync: string[] = [];
 
-    // ==========================================
-    // Step 1: Fetch all inventory via FBA Inventory Summaries API
-    // This is paginated and returns results immediately — no report generation.
-    // ==========================================
-    await appendLog("Step 1: Fetching inventory summaries...");
-
-    const allListings: InventoryListing[] = [];
-    let nextToken: string | null = null;
-    let pageCount = 0;
-    let totalRaw = 0;
-
-    do {
-      if (isOverDeadline(startTime)) {
-        await appendLog("Deadline approaching during inventory fetch — proceeding with " + allListings.length + " listings");
-        break;
-      }
-
-      let inventoryUrl = `/fba/inventory/v1/summaries?details=true&granularityType=Marketplace&granularityId=${marketplaceId}&marketplaceIds=${marketplaceId}`;
-      if (nextToken) {
-        inventoryUrl += `&nextToken=${encodeURIComponent(nextToken)}`;
-      }
-
-      const invRes = await spApiGet(inventoryUrl) as Record<string, unknown>;
-
-      if (invRes.error) {
-        // If FBA Inventory API fails (e.g., not enrolled), fall back to DB-only refresh
-        await appendLog("Inventory Summaries API failed: " + JSON.stringify(invRes).substring(0, 300));
-        await appendLog("Falling back to DB-based refresh (prices + ranks only)...");
-        break;
-      }
-
-      const payload = invRes.payload as Record<string, unknown> | undefined;
-      const summaries = payload?.inventorySummaries as Array<Record<string, unknown>> | undefined;
-      const pagination = invRes.pagination as Record<string, unknown> | undefined;
-
-      if (summaries && Array.isArray(summaries)) {
-        totalRaw += summaries.length;
-
-        for (const item of summaries) {
-          const sku = (item.sellerSku || "") as string;
-          if (!SKU_FILTER.test(sku)) continue;
-          const qty = (item.totalQuantity || 0) as number;
-          if (qty <= 0) continue; // skip out-of-stock
-
-          allListings.push({
-            asin: (item.asin || "") as string,
-            sku,
-            title: (item.productName || "") as string,
-            current_price: 0, // will be filled by Pricing API
-            sales_rank: null,
-            quantity: qty,
-          });
-        }
-      }
-
-      nextToken = pagination?.nextToken as string | null || null;
-      pageCount++;
-      await appendLog("  Page " + pageCount + ": " + (summaries?.length || 0) + " items, " + allListings.length + " DVDBOX/WIIBOX so far");
-
-    } while (nextToken);
-
-    await updateStatus({ total_raw: totalRaw });
-
-    // If Inventory API returned nothing, fall back to refreshing existing DB listings
-    let usingDbFallback = false;
-    if (allListings.length === 0) {
-      await appendLog("No listings from Inventory API — refreshing existing DB listings");
-      usingDbFallback = true;
-
+    if (skus && skus.length > 0) {
+      // Manual import — use provided SKUs
+      skusToSync = skus.filter((s) => SKU_FILTER.test(s));
+      await appendLog("Manual import: " + skusToSync.length + " valid SKUs provided");
+    } else {
+      // Refresh mode — reload all existing SKUs from the database
+      await appendLog("Refresh mode: loading existing SKUs from database...");
       const { data: dbListings } = await sb
         .from("listings")
-        .select("asin, sku, title, current_price, sales_rank, status")
-        .eq("status", "active");
+        .select("sku")
+        .eq("status", "active")
+        .or("sku.ilike.%dvdbox%,sku.ilike.%wiibox%");
 
       if (dbListings && dbListings.length > 0) {
-        for (const l of dbListings) {
-          if (SKU_FILTER.test(l.sku)) {
-            allListings.push({
-              asin: l.asin,
-              sku: l.sku,
-              title: l.title,
-              current_price: l.current_price || 0,
-              sales_rank: l.sales_rank,
-              quantity: 1,
-            });
-          }
-        }
-        await appendLog("Loaded " + allListings.length + " listings from DB for refresh");
+        skusToSync = dbListings.map((l: { sku: string }) => l.sku);
+        await appendLog("Found " + skusToSync.length + " existing SKUs to refresh");
+      } else {
+        await appendLog("No existing listings in DB. Use Import SKUs to add listings.");
+        await updateStatus({
+          status: "complete",
+          completed_at: new Date().toISOString(),
+          listings_synced: 0,
+          prices_fetched: 0,
+          ranks_fetched: 0,
+        });
+        return;
       }
     }
 
-    if (allListings.length === 0) {
+    await updateStatus({ total_raw: skusToSync.length });
+
+    // ==========================================
+    // Step 1: Look up each SKU via Listings Items API to get ASIN + title
+    // Process 10 at a time to avoid throttling
+    // ==========================================
+    await appendLog("Step 1: Looking up " + skusToSync.length + " SKUs via Listings Items API...");
+    const results: SyncedListing[] = [];
+    const LOOKUP_BATCH = 10;
+    let lookupsDone = 0;
+    let lookupsFailed = 0;
+
+    for (let i = 0; i < skusToSync.length; i += LOOKUP_BATCH) {
+      const batch = skusToSync.slice(i, i + LOOKUP_BATCH);
+
+      // Run batch in parallel (Listings Items API is per-SKU)
+      const promises = batch.map(async (sku) => {
+        try {
+          const encodedSku = encodeURIComponent(sku);
+          const res = await spApiGet(
+            `/listings/2021-08-01/items/${CONFIRMED_SELLER_ID}/${encodedSku}?marketplaceIds=${marketplaceId}&includedData=summaries`
+          ) as Record<string, unknown>;
+
+          if (res.error) {
+            console.warn(`  [${sku}] Listing lookup failed:`, (res.message as string || "").substring(0, 100));
+            lookupsFailed++;
+            return;
+          }
+
+          // Extract ASIN and title from summaries
+          const summaries = res.summaries as Array<Record<string, unknown>> | undefined;
+          let asin = "";
+          let title = "";
+
+          if (summaries && summaries.length > 0) {
+            asin = (summaries[0].asin || "") as string;
+            title = (summaries[0].itemName || "") as string;
+          }
+
+          if (!asin) {
+            // Try alternate response paths
+            asin = (res.asin || "") as string;
+          }
+
+          if (asin) {
+            results.push({
+              asin,
+              sku,
+              title,
+              current_price: 0,
+              sales_rank: null,
+            });
+            lookupsDone++;
+          } else {
+            console.warn(`  [${sku}] No ASIN found in response`);
+            lookupsFailed++;
+          }
+        } catch (err) {
+          console.warn(`  [${sku}] Lookup error:`, err);
+          lookupsFailed++;
+        }
+      });
+
+      await Promise.all(promises);
+      await appendLog("  Looked up " + (i + batch.length) + "/" + skusToSync.length + " SKUs (" + results.length + " found, " + lookupsFailed + " failed)");
+      await updateStatus({ listings_synced: results.length });
+
+      if (i + LOOKUP_BATCH < skusToSync.length) await sleep(300);
+    }
+
+    await appendLog("Listings found: " + results.length + " / " + skusToSync.length);
+
+    if (results.length === 0) {
       await updateStatus({
-        status: "complete",
+        status: lookupsFailed > 0 ? "failed" : "complete",
         completed_at: new Date().toISOString(),
         listings_synced: 0,
         prices_fetched: 0,
         ranks_fetched: 0,
+        error_message: lookupsFailed > 0 ? lookupsFailed + " SKU lookups failed" : null,
       });
-      await appendLog("No listings to sync");
       return;
     }
 
-    await appendLog("Total DVDBOX/WIIBOX listings: " + allListings.length);
-
     // ==========================================
     // Step 2: Batch-fetch live prices via Pricing API (20 SKUs per batch)
-    // Progressive: upsert after each batch so partial data is saved.
     // ==========================================
     await appendLog("Step 2: Fetching live prices...");
-    const skus = allListings.map((l) => l.sku).filter(Boolean);
+    const priceSkus = results.map((l) => l.sku).filter(Boolean);
     let pricesFetched = 0;
     const PRICE_BATCH = 20;
 
-    for (let i = 0; i < skus.length; i += PRICE_BATCH) {
-      if (isOverDeadline(startTime)) {
-        await appendLog("Deadline approaching during price fetch — got " + pricesFetched + " prices");
-        break;
-      }
-
-      const batch = skus.slice(i, i + PRICE_BATCH);
+    for (let i = 0; i < priceSkus.length; i += PRICE_BATCH) {
+      const batch = priceSkus.slice(i, i + PRICE_BATCH);
       const skuParam = batch.map((s) => encodeURIComponent(s)).join("&Skus=");
 
       try {
@@ -275,7 +268,7 @@ async function runSync(jobId: string) {
             }
 
             if (livePrice !== null) {
-              const listing = allListings.find((l) => l.sku === sku);
+              const listing = results.find((l) => l.sku === sku);
               if (listing) {
                 listing.current_price = livePrice;
                 pricesFetched++;
@@ -288,26 +281,20 @@ async function runSync(jobId: string) {
       }
 
       await updateStatus({ prices_fetched: pricesFetched });
-
-      if (i + PRICE_BATCH < skus.length) await sleep(200);
+      if (i + PRICE_BATCH < priceSkus.length) await sleep(200);
     }
 
-    await appendLog("Live prices fetched: " + pricesFetched + " / " + skus.length);
+    await appendLog("Prices fetched: " + pricesFetched + " / " + priceSkus.length);
 
     // ==========================================
     // Step 3: Batch-fetch sales ranks via Catalog Items API (5 at a time)
     // ==========================================
     await appendLog("Step 3: Fetching sales ranks...");
-    const asins = [...new Set(allListings.map((l) => l.asin).filter(Boolean))];
+    const asins = [...new Set(results.map((l) => l.asin).filter(Boolean))];
     let ranksFetched = 0;
     const RANK_BATCH = 5;
 
     for (let i = 0; i < asins.length; i += RANK_BATCH) {
-      if (isOverDeadline(startTime)) {
-        await appendLog("Deadline approaching during rank fetch — got " + ranksFetched + " ranks");
-        break;
-      }
-
       const batch = asins.slice(i, i + RANK_BATCH);
       const promises = batch.map(async (asin) => {
         try {
@@ -322,8 +309,7 @@ async function runSync(jobId: string) {
               if (ranks && ranks.length > 0) {
                 const rank = ranks[0].rank ?? ranks[0].value;
                 if (typeof rank === "number") {
-                  // Apply rank to all listings with this ASIN
-                  for (const l of allListings) {
+                  for (const l of results) {
                     if (l.asin === asin) l.sales_rank = rank;
                   }
                   ranksFetched++;
@@ -338,21 +324,20 @@ async function runSync(jobId: string) {
       await Promise.all(promises);
 
       await updateStatus({ ranks_fetched: ranksFetched });
-
       if (i + RANK_BATCH < asins.length) await sleep(200);
     }
 
-    await appendLog("Sales ranks fetched: " + ranksFetched + " / " + asins.length);
+    await appendLog("Ranks fetched: " + ranksFetched + " / " + asins.length);
 
     // ==========================================
-    // Step 4: Upsert all listings into Supabase
+    // Step 4: Upsert into Supabase
     // ==========================================
-    await appendLog("Step 4: Upserting " + allListings.length + " listings...");
+    await appendLog("Step 4: Upserting " + results.length + " listings...");
     let synced = 0;
     const UPSERT_BATCH = 50;
 
-    for (let i = 0; i < allListings.length; i += UPSERT_BATCH) {
-      const batch = allListings.slice(i, i + UPSERT_BATCH);
+    for (let i = 0; i < results.length; i += UPSERT_BATCH) {
+      const batch = results.slice(i, i + UPSERT_BATCH);
       const rows = batch.map((l) => {
         const row: Record<string, unknown> = {
           asin: l.asin,
@@ -360,9 +345,7 @@ async function runSync(jobId: string) {
           title: l.title,
           status: "active",
         };
-        // Only update price if we got a live price (> 0)
         if (l.current_price > 0) row.current_price = l.current_price;
-        // Only update rank if we got one
         if (l.sales_rank !== null) row.sales_rank = l.sales_rank;
         return row;
       });
@@ -372,17 +355,13 @@ async function runSync(jobId: string) {
         .upsert(rows, { onConflict: "sku", ignoreDuplicates: false });
 
       if (error) {
-        await appendLog("Upsert error (batch " + Math.floor(i / UPSERT_BATCH) + "): " + error.message);
+        await appendLog("Upsert error: " + error.message);
       } else {
         synced += batch.length;
       }
-
-      await updateStatus({ listings_synced: synced });
     }
 
-    const elapsed = Math.round((Date.now() - startTime) / 1000);
-    await appendLog("Sync complete in " + elapsed + "s: " + synced + " listings, " + pricesFetched + " prices, " + ranksFetched + " ranks");
-
+    await appendLog("Sync complete: " + synced + " listings upserted, " + pricesFetched + " prices, " + ranksFetched + " ranks");
     await updateStatus({
       status: "complete",
       completed_at: new Date().toISOString(),
@@ -413,11 +392,13 @@ serve(async (req: Request) => {
   }
 
   try {
-    const { jobId } = await req.json();
+    const body = await req.json();
+    const jobId = body.jobId;
+    const skus = body.skus as string[] | undefined;
+
     if (!jobId) throw new Error("Missing jobId");
 
-    // Run sync — respond immediately if EdgeRuntime.waitUntil is available
-    const syncPromise = runSync(jobId);
+    const syncPromise = runSync(jobId, skus);
 
     // deno-lint-ignore no-explicit-any
     const runtime = (globalThis as any).EdgeRuntime;
@@ -428,7 +409,6 @@ serve(async (req: Request) => {
       });
     }
 
-    // Fallback: run synchronously
     await syncPromise;
     return new Response(JSON.stringify({ ok: true, jobId, note: "sync completed synchronously" }), {
       headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" },

@@ -125,188 +125,24 @@ function sleep(ms: number) {
 // ---- Action Handlers ----
 
 async function handleFetchListings(): Promise<unknown> {
-  const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
-  const sellerId = getActiveSellerId();
+  // fetchListings is now a lightweight action that returns listings from Supabase DB.
+  // Use startSync or importSkus to populate/refresh from Amazon.
+  const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  const sb = createClient(supabaseUrl, serviceKey);
 
-  console.log("========================================");
-  console.log("=== FETCH LISTINGS (Inventory Summaries API) ===");
-  console.log("Seller ID:", sellerId);
-  console.log("Marketplace:", marketplaceId);
-  console.log("========================================");
+  const { data: listings, error } = await sb
+    .from("listings")
+    .select("*")
+    .eq("status", "active")
+    .or("sku.ilike.%dvdbox%,sku.ilike.%wiibox%")
+    .order("sku", { ascending: true });
 
-  const skuFilter = /dvdbox|wiibox/i;
-  const listings: { asin: string; sku: string; title: string; current_price: number; quantity: number; status: string; sales_rank: number | null }[] = [];
-  let nextToken: string | null = null;
-  let totalRaw = 0;
-  let pageCount = 0;
-
-  // Step 1: Fetch all inventory via FBA Inventory Summaries API (paginated, instant)
-  console.log("Step 1: Fetching inventory summaries...");
-  do {
-    let inventoryUrl = `/fba/inventory/v1/summaries?details=true&granularityType=Marketplace&granularityId=${marketplaceId}&marketplaceIds=${marketplaceId}`;
-    if (nextToken) {
-      inventoryUrl += `&nextToken=${encodeURIComponent(nextToken)}`;
-    }
-
-    const invRes = await spApiRequest(inventoryUrl) as Record<string, unknown>;
-
-    if (invRes.error) {
-      console.error("Inventory Summaries API failed:", JSON.stringify(invRes));
-      return invRes;
-    }
-
-    const payload = invRes.payload as Record<string, unknown> | undefined;
-    const summaries = payload?.inventorySummaries as Array<Record<string, unknown>> | undefined;
-    const pagination = invRes.pagination as Record<string, unknown> | undefined;
-
-    if (summaries && Array.isArray(summaries)) {
-      totalRaw += summaries.length;
-      for (const item of summaries) {
-        const sku = (item.sellerSku || "") as string;
-        if (!skuFilter.test(sku)) continue;
-        const qty = (item.totalQuantity || 0) as number;
-        if (qty <= 0) continue;
-
-        listings.push({
-          asin: (item.asin || "") as string,
-          sku,
-          title: (item.productName || "") as string,
-          current_price: 0,
-          quantity: qty,
-          status: "active",
-          sales_rank: null,
-        });
-      }
-    }
-
-    nextToken = pagination?.nextToken as string | null || null;
-    pageCount++;
-    console.log(`  Page ${pageCount}: ${summaries?.length || 0} items, ${listings.length} DVDBOX/WIIBOX so far`);
-  } while (nextToken);
-
-  console.log("Active DVDBOX/WIIBOX listings:", listings.length);
-
-  for (const l of listings) {
-    console.log(`  [${l.sku}] ${l.asin} — "${l.title.substring(0, 60)}"`);
+  if (error) {
+    return { error: true, message: error.message };
   }
 
-  // Step 2: Batch-fetch sales ranks from Catalog Items API (5 at a time)
-  const asins = [...new Set(listings.map((l) => l.asin).filter(Boolean))];
-  console.log("========================================");
-  console.log("=== FETCHING SALES RANKS for", asins.length, "ASINs ===");
-  console.log("========================================");
-
-  const salesRankMap: Record<string, number> = {};
-  const BATCH_SIZE = 5;
-  for (let i = 0; i < asins.length; i += BATCH_SIZE) {
-    const batch = asins.slice(i, i + BATCH_SIZE);
-    const promises = batch.map(async (asin) => {
-      try {
-        const catRes = await spApiRequest(
-          `/catalog/2022-04-01/items/${asin}?marketplaceIds=${marketplaceId}&includedData=salesRanks`
-        ) as Record<string, unknown>;
-
-        if (catRes && !catRes.error) {
-          const salesRanks = catRes.salesRanks as Array<Record<string, unknown>> | undefined;
-          if (salesRanks && salesRanks.length > 0) {
-            const primary = salesRanks[0];
-            const ranks = primary.ranks as Array<{ rank?: number; value?: number }> | undefined;
-            if (ranks && ranks.length > 0) {
-              const rank = ranks[0].rank ?? ranks[0].value;
-              if (typeof rank === "number") {
-                salesRankMap[asin] = rank;
-                console.log(`  Sales rank for ${asin}: #${rank}`);
-              }
-            }
-          }
-        }
-      } catch (err) {
-        console.warn(`  Failed to get sales rank for ${asin}:`, err);
-      }
-    });
-    await Promise.all(promises);
-    if (i + BATCH_SIZE < asins.length) await sleep(500);
-  }
-
-  for (const listing of listings) {
-    if (listing.asin && salesRankMap[listing.asin] !== undefined) {
-      listing.sales_rank = salesRankMap[listing.asin];
-    }
-  }
-
-  // Step 3: Fetch real-time prices via Pricing API (20 SKUs per batch)
-  const skus = listings.map((l) => l.sku).filter(Boolean);
-  console.log("========================================");
-  console.log("=== FETCHING REAL-TIME PRICES for", skus.length, "SKUs ===");
-  console.log("========================================");
-
-  const livePriceMap: Record<string, number> = {};
-  const PRICE_BATCH = 20;
-  for (let i = 0; i < skus.length; i += PRICE_BATCH) {
-    const batch = skus.slice(i, i + PRICE_BATCH);
-    const skuParam = batch.map((s) => encodeURIComponent(s)).join("&Skus=");
-    try {
-      const priceRes = await spApiRequest(
-        `/products/pricing/v0/price?MarketplaceId=${marketplaceId}&Skus=${skuParam}&ItemType=Sku`
-      ) as Record<string, unknown>;
-
-      const payload = priceRes.payload as Array<Record<string, unknown>> | undefined;
-      if (payload && Array.isArray(payload)) {
-        for (const item of payload) {
-          const itemStatus = item.status as string || item.Status as string || "";
-          const sku = (item.SKU || item.SellerSKU || item.seller_sku || item.sku) as string;
-          if (!sku || itemStatus !== "Success") continue;
-
-          const product = item.Product as Record<string, unknown> | undefined;
-          let livePrice: number | null = null;
-
-          if (product) {
-            const offers = product.Offers as Array<Record<string, unknown>> | undefined;
-            if (offers && offers.length > 0) {
-              const buyingPrice = offers[0].BuyingPrice as Record<string, unknown> | undefined;
-              if (buyingPrice) {
-                const listingPrice = buyingPrice.ListingPrice as Record<string, unknown> | undefined;
-                if (listingPrice) {
-                  const amt = parseFloat(listingPrice.Amount as string || "0");
-                  if (amt > 0) livePrice = amt;
-                }
-              }
-              if (livePrice === null) {
-                const regularPrice = offers[0].RegularPrice as Record<string, unknown> | undefined;
-                if (regularPrice) {
-                  const amt = parseFloat(regularPrice.Amount as string || "0");
-                  if (amt > 0) livePrice = amt;
-                }
-              }
-            }
-          }
-
-          if (livePrice !== null) {
-            livePriceMap[sku] = livePrice;
-            console.log(`  [${sku}] Live price: $${livePrice.toFixed(2)}`);
-          }
-        }
-      }
-    } catch (err) {
-      console.warn("Pricing API batch failed:", err);
-    }
-    if (i + PRICE_BATCH < skus.length) await sleep(500);
-  }
-
-  for (const listing of listings) {
-    if (listing.sku && livePriceMap[listing.sku] !== undefined) {
-      listing.current_price = livePriceMap[listing.sku];
-    }
-  }
-
-  console.log("========================================");
-  console.log("=== SYNC COMPLETE ===");
-  console.log("Listings with sales rank:", listings.filter((l) => l.sales_rank !== null).length);
-  console.log("Listings with live price:", Object.keys(livePriceMap).length);
-  console.log("Total listings returned:", listings.length);
-  console.log("========================================");
-
-  return { listings, totalRaw, salesRanksFound: Object.keys(salesRankMap).length, livePricesFound: Object.keys(livePriceMap).length };
+  return { listings: listings || [], totalRaw: listings?.length || 0 };
 }
 
 async function handleGetCompetitivePrice(asin: string): Promise<unknown> {
@@ -549,7 +385,7 @@ async function handleTestCatalog(asin: string): Promise<unknown> {
   return { action: "testCatalog", asin, result };
 }
 
-async function handleStartSync(): Promise<unknown> {
+async function handleStartSync(skus?: string[]): Promise<unknown> {
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const sb = createClient(supabaseUrl, serviceKey);
@@ -570,18 +406,23 @@ async function handleStartSync(): Promise<unknown> {
 
   // Fire off the sp-api-sync function asynchronously
   const syncFnUrl = `${supabaseUrl}/functions/v1/sp-api-sync`;
+  const syncBody: Record<string, unknown> = { jobId };
+  if (skus && skus.length > 0) {
+    syncBody.skus = skus;
+  }
+
   fetch(syncFnUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${serviceKey}`,
     },
-    body: JSON.stringify({ jobId }),
+    body: JSON.stringify(syncBody),
   }).catch((err) => {
     console.error("Failed to invoke sp-api-sync:", err);
   });
 
-  return { ok: true, jobId, message: "Sync started" };
+  return { ok: true, jobId, message: skus ? "Import started (" + skus.length + " SKUs)" : "Sync started" };
 }
 
 async function handleGetSyncStatus(jobId?: string): Promise<unknown> {
@@ -668,7 +509,12 @@ serve(async (req: Request) => {
         break;
 
       case "startSync":
-        result = await handleStartSync();
+        result = await handleStartSync(params.skus);
+        break;
+
+      case "importSkus":
+        if (!params.skus?.length) throw new Error("Missing required param: skus[]");
+        result = await handleStartSync(params.skus);
         break;
 
       case "getSyncStatus":
@@ -676,7 +522,7 @@ serve(async (req: Request) => {
         break;
 
       default:
-        throw new Error(`Unknown action: ${action}. Valid: fetchListings, getCompetitivePrice, getCompetitivePriceBatch, updatePrice, getSalesRank, getSalesRankBatch, getListingInfo, verifySeller, testCatalog, startSync, getSyncStatus`);
+        throw new Error(`Unknown action: ${action}. Valid: fetchListings, getCompetitivePrice, getCompetitivePriceBatch, updatePrice, getSalesRank, getSalesRankBatch, getListingInfo, verifySeller, testCatalog, startSync, importSkus, getSyncStatus`);
     }
 
     return new Response(JSON.stringify(result), {
