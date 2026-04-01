@@ -931,6 +931,7 @@ function renderRepricer() {
         <div class="repricer-actions" style="margin-bottom:12px;">
           <button class="btn-reprice primary" id="btn-test-reprice" onclick="handleRunTestReprice()">Run Test Reprice</button>
           ${testResults.some(r => r.changed) ? '<button class="btn-reprice secondary" id="btn-push-amazon" onclick="handlePushToAmazon()" style="background:#ff6600;color:#fff;">Push Changes to Amazon</button>' : ''}
+          <button class="btn-reprice secondary" id="btn-force-push" onclick="handleForceTestPush()">Force Test Push</button>
         </div>
         <div class="repricer-status" id="test-status"></div>
         ${(() => {
@@ -1531,6 +1532,50 @@ async function handlePushToAmazon() {
           (p.success
             ? '<span style="color:#22ff55;font-weight:600;">Sent</span>'
             : '<span style="color:#ff4444;">Failed: ' + esc(p.detail) + '</span>') +
+        '</div>'
+      ).join('');
+  }
+}
+
+async function handleForceTestPush() {
+  const tl = getTestListings();
+  if (tl.length === 0) { alert('No test SKUs in database.'); return; }
+
+  const btn = document.getElementById('btn-force-push');
+  if (btn) { btn.disabled = true; btn.textContent = 'Pushing...'; }
+  const statusEl = document.getElementById('test-status');
+
+  const pushResults = [];
+
+  for (const l of tl) {
+    if (statusEl) { statusEl.className = 'repricer-status info'; statusEl.textContent = 'Sending ' + l.sku + ' at $' + l.current_price.toFixed(2) + '...'; }
+    try {
+      const res = await callSpApi('updatePrice', { sku: l.sku, price: l.current_price });
+      const raw = JSON.stringify(res);
+      const hasError = res.error || (res.status && res.status === 'INVALID');
+      pushResults.push({ sku: l.sku, price: l.current_price, success: !hasError, detail: raw });
+    } catch (e) {
+      pushResults.push({ sku: l.sku, price: l.current_price, success: false, detail: e.message });
+    }
+  }
+
+  if (btn) { btn.disabled = false; btn.textContent = 'Force Test Push'; }
+  if (statusEl) {
+    const ok = pushResults.filter(p => p.success).length;
+    const fail = pushResults.filter(p => !p.success).length;
+    statusEl.className = fail > 0 ? 'repricer-status' : 'repricer-status success';
+    if (fail > 0) { statusEl.style.display = 'block'; statusEl.style.background = '#2a0a0a'; statusEl.style.color = '#ff4444'; statusEl.style.borderColor = '#4a1a1a'; }
+    statusEl.innerHTML = '<div style="margin-bottom:8px;font-weight:700;">Force Test Push Results: ' + ok + ' sent, ' + fail + ' failed</div>' +
+      pushResults.map(p =>
+        '<div style="padding:6px 0;border-bottom:1px solid #222;">' +
+          '<div style="display:flex;gap:12px;align-items:center;">' +
+            '<span style="font-weight:600;width:180px;">' + esc(p.sku) + '</span>' +
+            '<span style="width:80px;">$' + p.price.toFixed(2) + '</span>' +
+            (p.success
+              ? '<span style="color:#22ff55;font-weight:600;">Sent</span>'
+              : '<span style="color:#ff4444;font-weight:600;">Failed</span>') +
+          '</div>' +
+          '<div style="font-size:11px;color:#888;margin-top:4px;word-break:break-all;">' + esc(p.detail) + '</div>' +
         '</div>'
       ).join('');
   }
