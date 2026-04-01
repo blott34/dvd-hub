@@ -1205,77 +1205,94 @@ async function handleRunRepricer() {
   }
 }
 
+let syncPollTimer = null;
+
 async function handleSyncFromAmazon() {
   const btn = document.getElementById('btn-sync-amazon');
-  if (btn) { btn.disabled = true; btn.textContent = 'Syncing from Amazon... (may take up to 60s)'; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Starting sync...'; }
   const status = document.getElementById('repricer-status');
-  if (status) { status.className = 'repricer-status info'; status.style.display = 'block'; status.textContent = 'Requesting listings report from Amazon SP-API...'; }
+  if (status) { status.className = 'repricer-status info'; status.style.display = 'block'; status.textContent = 'Starting Amazon sync job...'; }
 
   try {
-    const result = await callSpApi('fetchListings');
+    const result = await callSpApi('startSync');
 
     if (result.error) {
-      if (status) { status.className = 'repricer-status'; status.style.display = 'block'; status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.textContent = 'Amazon sync error: ' + (result.message || JSON.stringify(result)); }
+      if (status) { status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.textContent = 'Failed to start sync: ' + (result.message || JSON.stringify(result)); }
       if (btn) { btn.disabled = false; btn.textContent = 'Sync from Amazon'; }
       return;
     }
 
-    const amazonListings = result.listings || [];
-    if (status) { status.textContent = 'Got ' + amazonListings.length + ' active listings from Amazon. Syncing to database...'; }
+    const jobId = result.jobId;
+    if (status) { status.textContent = 'Sync job started. Waiting for Amazon report...'; }
+    if (btn) { btn.textContent = 'Syncing...'; }
 
-    // Upsert each listing into Supabase (merge with existing data)
-    const skuSyncFilter = /dvdbox|wiibox/i;
-    for (const al of amazonListings) {
-      if (!al.sku || !al.asin) continue;
-      if (!skuSyncFilter.test(al.sku)) continue;
-      const existing = repricerListings.find(l => l.sku === al.sku);
-      const updateFields = {
-          current_price: al.current_price,
-          title: al.title,
-          asin: al.asin,
-        };
-      if (al.sales_rank != null) updateFields.sales_rank = al.sales_rank;
+    // Poll for status every 5 seconds
+    if (syncPollTimer) clearInterval(syncPollTimer);
+    syncPollTimer = setInterval(() => pollSyncStatus(jobId), 5000);
 
-      if (existing) {
-        // Update price, title, sales_rank from Amazon, keep local min/max/cost_basis
-        await updateListingInDb(existing.id, updateFields);
-      } else {
-        // Insert new listing
-        await fetch(`${SUPABASE_URL}/rest/v1/listings`, {
-          method: 'POST',
-          headers: {
-            'apikey': SUPABASE_KEY,
-            'Authorization': `Bearer ${SUPABASE_KEY}`,
-            'Content-Type': 'application/json',
-            'Prefer': 'return=minimal',
-          },
-          body: JSON.stringify({
-            asin: al.asin,
-            sku: al.sku,
-            title: al.title,
-            current_price: al.current_price || 0,
-            min_price: 8.50,
-            max_price: 24.99,
-            cost_basis: 0,
-            sales_rank: al.sales_rank || null,
-            status: 'active',
-          }),
-        });
-      }
-    }
-
-    // Reload from DB
-    await initRepricerData();
-    const section = document.getElementById('repricer-section');
-    section.outerHTML = renderRepricer();
-    const newStatus = document.getElementById('repricer-status');
-    if (newStatus) {
-      newStatus.className = 'repricer-status success';
-      newStatus.textContent = 'Amazon sync complete: ' + amazonListings.length + ' listings synced.';
-    }
   } catch (e) {
-    if (status) { status.className = 'repricer-status'; status.style.display = 'block'; status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.textContent = 'Sync error: ' + e.message; }
+    if (status) { status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.textContent = 'Sync error: ' + e.message; }
     if (btn) { btn.disabled = false; btn.textContent = 'Sync from Amazon'; }
+  }
+}
+
+async function pollSyncStatus(jobId) {
+  const btn = document.getElementById('btn-sync-amazon');
+  const status = document.getElementById('repricer-status');
+
+  try {
+    const result = await callSpApi('getSyncStatus', { jobId });
+
+    if (result.error) {
+      console.warn('getSyncStatus error:', result);
+      return;
+    }
+
+    const s = result;
+    const elapsed = Math.round((Date.now() - new Date(s.started_at).getTime()) / 1000);
+
+    if (s.status === 'running') {
+      // Build progress message
+      let msg = 'Syncing... (' + elapsed + 's)';
+      if (s.listings_synced > 0) msg = 'Upserting listings: ' + s.listings_synced + ' done (' + elapsed + 's)';
+      else if (s.ranks_fetched > 0) msg = 'Fetching sales ranks: ' + s.ranks_fetched + ' done (' + elapsed + 's)';
+      else if (s.prices_fetched > 0) msg = 'Fetching live prices: ' + s.prices_fetched + ' done (' + elapsed + 's)';
+      else if (s.total_raw > 0) msg = 'Report downloaded: ' + s.total_raw + ' rows. Fetching prices... (' + elapsed + 's)';
+      else msg = 'Waiting for Amazon report... (' + elapsed + 's)';
+
+      if (status) { status.className = 'repricer-status info'; status.style.display = 'block'; status.textContent = msg; }
+      if (btn) { btn.textContent = 'Syncing... ' + elapsed + 's'; }
+      return;
+    }
+
+    // Done — stop polling
+    clearInterval(syncPollTimer);
+    syncPollTimer = null;
+
+    if (s.status === 'complete') {
+      if (status) { status.className = 'repricer-status success'; status.style.display = 'block'; status.textContent = 'Sync complete: ' + s.listings_synced + ' listings synced, ' + s.prices_fetched + ' prices, ' + s.ranks_fetched + ' ranks (' + elapsed + 's)'; }
+
+      // Reload listings from DB
+      await initRepricerData();
+      const section = document.getElementById('repricer-section');
+      if (section) {
+        section.outerHTML = renderRepricer();
+        // Re-show success message on new status element
+        const newStatus = document.getElementById('repricer-status');
+        if (newStatus) {
+          newStatus.className = 'repricer-status success';
+          newStatus.style.display = 'block';
+          newStatus.textContent = 'Sync complete: ' + s.listings_synced + ' listings synced, ' + s.prices_fetched + ' prices, ' + s.ranks_fetched + ' ranks (' + elapsed + 's)';
+        }
+      }
+    } else if (s.status === 'failed') {
+      if (status) { status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.style.display = 'block'; status.textContent = 'Sync failed: ' + (s.error_message || 'Unknown error'); }
+    }
+
+    if (btn) { btn.disabled = false; btn.textContent = 'Sync from Amazon'; }
+
+  } catch (e) {
+    console.warn('Poll error:', e);
   }
 }
 

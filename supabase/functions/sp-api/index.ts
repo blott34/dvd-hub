@@ -11,6 +11,7 @@
 //   supabase secrets set SP_API_SELLER_ID=YOUR_SELLER_ID
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.3";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -630,6 +631,67 @@ async function handleTestCatalog(asin: string): Promise<unknown> {
   return { action: "testCatalog", asin, result };
 }
 
+async function handleStartSync(): Promise<unknown> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  const sb = createClient(supabaseUrl, serviceKey);
+
+  // Create a sync job row
+  const { data: job, error: insertErr } = await sb
+    .from("sync_status")
+    .insert({ status: "running" })
+    .select("id")
+    .single();
+
+  if (insertErr || !job) {
+    return { error: true, message: "Failed to create sync job: " + (insertErr?.message || "unknown") };
+  }
+
+  const jobId = job.id;
+  console.log("Created sync job:", jobId);
+
+  // Fire off the sp-api-sync function asynchronously
+  const syncFnUrl = `${supabaseUrl}/functions/v1/sp-api-sync`;
+  fetch(syncFnUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${serviceKey}`,
+    },
+    body: JSON.stringify({ jobId }),
+  }).catch((err) => {
+    console.error("Failed to invoke sp-api-sync:", err);
+  });
+
+  return { ok: true, jobId, message: "Sync started" };
+}
+
+async function handleGetSyncStatus(jobId?: string): Promise<unknown> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  const sb = createClient(supabaseUrl, serviceKey);
+
+  if (jobId) {
+    const { data, error } = await sb
+      .from("sync_status")
+      .select("*")
+      .eq("id", jobId)
+      .single();
+    if (error) return { error: true, message: error.message };
+    return data;
+  }
+
+  // Return the most recent sync job
+  const { data, error } = await sb
+    .from("sync_status")
+    .select("*")
+    .order("started_at", { ascending: false })
+    .limit(1)
+    .single();
+  if (error) return { error: true, message: error.message };
+  return data;
+}
+
 // ---- Main Handler ----
 
 serve(async (req: Request) => {
@@ -687,8 +749,16 @@ serve(async (req: Request) => {
         result = await handleTestCatalog(params.asin);
         break;
 
+      case "startSync":
+        result = await handleStartSync();
+        break;
+
+      case "getSyncStatus":
+        result = await handleGetSyncStatus(params.jobId);
+        break;
+
       default:
-        throw new Error(`Unknown action: ${action}. Valid: fetchListings, getCompetitivePrice, getCompetitivePriceBatch, updatePrice, getSalesRank, getSalesRankBatch, getListingInfo, verifySeller, testCatalog`);
+        throw new Error(`Unknown action: ${action}. Valid: fetchListings, getCompetitivePrice, getCompetitivePriceBatch, updatePrice, getSalesRank, getSalesRankBatch, getListingInfo, verifySeller, testCatalog, startSync, getSyncStatus`);
     }
 
     return new Response(JSON.stringify(result), {
