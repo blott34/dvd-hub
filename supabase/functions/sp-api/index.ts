@@ -220,15 +220,50 @@ async function handleGetCompetitivePriceBatch(asins: string[]): Promise<unknown>
   return result;
 }
 
+async function handleGetListingInfo(sku: string): Promise<unknown> {
+  const sellerId = Deno.env.get("SP_API_SELLER_ID") || "";
+  const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
+  const encodedSku = encodeURIComponent(sku);
+
+  const result = await spApiRequest(
+    `/listings/2021-08-01/items/${sellerId}/${encodedSku}?marketplaceIds=${marketplaceId}&includedData=summaries,attributes,offers,issues&issueLocale=en_US`
+  );
+  return result;
+}
+
+async function handleVerifySeller(): Promise<unknown> {
+  const result = await spApiRequest("/sellers/v1/marketplaceParticipations");
+  return result;
+}
+
 async function handleUpdatePrice(sku: string, price: number): Promise<unknown> {
   const sellerId = Deno.env.get("SP_API_SELLER_ID") || "";
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
   const encodedSku = encodeURIComponent(sku);
   const priceStr = price.toFixed(2);
 
-  // Listings Items API 2021-08-01 — PATCH to update price
-  const body = {
-    productType: "HOME_VIDEO",
+  // Step 1: GET the listing to discover the real productType
+  console.log("=== FETCHING LISTING INFO FOR PRODUCT TYPE ===");
+  const listingInfo = await spApiRequest(
+    `/listings/2021-08-01/items/${sellerId}/${encodedSku}?marketplaceIds=${marketplaceId}&includedData=summaries,attributes&issueLocale=en_US`
+  ) as Record<string, unknown>;
+
+  let productType = "PRODUCT"; // fallback
+  if (listingInfo && !listingInfo.error) {
+    // productType is in summaries[0].productType
+    const summaries = listingInfo.summaries as Array<Record<string, unknown>> | undefined;
+    if (summaries && summaries.length > 0 && summaries[0].productType) {
+      productType = summaries[0].productType as string;
+    }
+    console.log("Discovered productType:", productType);
+  } else {
+    console.log("Could not fetch listing info, using fallback productType:", productType);
+    console.log("Listing info response:", JSON.stringify(listingInfo));
+  }
+
+  // Step 2: PATCH with the correct productType
+  const patchBody = {
+    productType,
     patches: [
       {
         op: "replace",
@@ -252,12 +287,76 @@ async function handleUpdatePrice(sku: string, price: number): Promise<unknown> {
     ],
   };
 
-  const result = await spApiRequest(
+  console.log("=== PATCH REQUEST ===");
+  console.log("productType:", productType);
+  console.log("SKU:", sku, "→ encoded:", encodedSku);
+  console.log("Price:", priceStr);
+
+  const patchResult = await spApiRequest(
     `/listings/2021-08-01/items/${sellerId}/${encodedSku}?marketplaceIds=${marketplaceId}&issueLocale=en_US`,
     "PATCH",
-    body
-  );
-  return result;
+    patchBody
+  ) as Record<string, unknown>;
+
+  // If PATCH succeeded, return it
+  if (!patchResult.error) {
+    return { method: "PATCH", productType, ...patchResult };
+  }
+
+  console.log("=== PATCH FAILED, TRYING FEEDS API FALLBACK ===");
+
+  // Step 3: Feeds API fallback — POST_FLAT_FILE_PRICEANDQUANTITYONLY_UPDATE_DATA
+  const feedContent = "sku\tprice\n" + sku + "\t" + priceStr + "\n";
+
+  // Create feed document
+  const docRes = await spApiRequest("/feeds/2021-06-30/documents", "POST", {
+    contentType: "text/tab-separated-values; charset=UTF-8",
+  }) as Record<string, unknown>;
+
+  if (docRes.error) {
+    return { method: "FEEDS_FALLBACK", patchError: patchResult, feedDocError: docRes };
+  }
+
+  const feedDocId = docRes.feedDocumentId as string;
+  const uploadUrl = docRes.url as string;
+
+  if (!uploadUrl) {
+    return { method: "FEEDS_FALLBACK", patchError: patchResult, error: "No upload URL returned", docRes };
+  }
+
+  // Upload the TSV content to the presigned URL
+  console.log("Uploading feed content to:", uploadUrl);
+  console.log("Feed content:", feedContent);
+
+  const uploadRes = await fetch(uploadUrl, {
+    method: "PUT",
+    headers: { "Content-Type": "text/tab-separated-values; charset=UTF-8" },
+    body: feedContent,
+  });
+
+  if (!uploadRes.ok) {
+    const uploadErr = await uploadRes.text();
+    return { method: "FEEDS_FALLBACK", patchError: patchResult, uploadError: uploadErr };
+  }
+
+  // Create the feed
+  const feedRes = await spApiRequest("/feeds/2021-06-30/feeds", "POST", {
+    feedType: "POST_FLAT_FILE_PRICEANDQUANTITYONLY_UPDATE_DATA",
+    marketplaceIds: [marketplaceId],
+    inputFeedDocumentId: feedDocId,
+  }) as Record<string, unknown>;
+
+  if (feedRes.error) {
+    return { method: "FEEDS_FALLBACK", patchError: patchResult, feedError: feedRes };
+  }
+
+  return {
+    method: "FEEDS_FALLBACK",
+    feedId: feedRes.feedId,
+    status: "SUBMITTED",
+    note: "Feed submitted. Price update will process in 5-15 minutes.",
+    patchError: patchResult,
+  };
 }
 
 async function handleGetSalesRank(asin: string): Promise<unknown> {
@@ -327,8 +426,17 @@ serve(async (req: Request) => {
         result = await handleGetSalesRankBatch(params.asins);
         break;
 
+      case "getListingInfo":
+        if (!params.sku) throw new Error("Missing required param: sku");
+        result = await handleGetListingInfo(params.sku);
+        break;
+
+      case "verifySeller":
+        result = await handleVerifySeller();
+        break;
+
       default:
-        throw new Error(`Unknown action: ${action}. Valid: fetchListings, getCompetitivePrice, getCompetitivePriceBatch, updatePrice, getSalesRank, getSalesRankBatch`);
+        throw new Error(`Unknown action: ${action}. Valid: fetchListings, getCompetitivePrice, getCompetitivePriceBatch, updatePrice, getSalesRank, getSalesRankBatch, getListingInfo, verifySeller`);
     }
 
     return new Response(JSON.stringify(result), {
