@@ -92,18 +92,84 @@ async function spApiRequest(path: string, method = "GET", body?: unknown): Promi
   }
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseTsv(tsv: string): Record<string, string>[] {
+  const lines = tsv.trim().split("\n");
+  if (lines.length < 2) return [];
+  const headers = lines[0].split("\t").map((h) => h.trim());
+  const rows: Record<string, string>[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split("\t");
+    const row: Record<string, string> = {};
+    for (let j = 0; j < headers.length; j++) {
+      row[headers[j]] = (cols[j] || "").trim();
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
 // ---- Action Handlers ----
 
 async function handleFetchListings(): Promise<unknown> {
-  const sellerId = Deno.env.get("SP_API_SELLER_ID") || "";
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
 
-  // Get all active listing items via the Listings Items API
-  // This returns items for the seller in the given marketplace
-  const result = await spApiRequest(
-    `/listings/2021-08-01/items/${sellerId}?marketplaceIds=${marketplaceId}&includedData=summaries,attributes,issues&pageSize=50`
-  );
-  return result;
+  // Step 1: Request a GET_MERCHANT_LISTINGS_ALL_DATA report
+  const createRes = await spApiRequest("/reports/2021-06-30/reports", "POST", {
+    reportType: "GET_MERCHANT_LISTINGS_ALL_DATA",
+    marketplaceIds: [marketplaceId],
+  }) as Record<string, unknown>;
+
+  if (createRes.error) return createRes;
+  const reportId = createRes.reportId as string;
+  if (!reportId) return { error: true, message: "No reportId returned", data: createRes };
+
+  // Step 2: Poll until report is done (max ~60s)
+  let reportDocId: string | null = null;
+  for (let i = 0; i < 20; i++) {
+    await sleep(3000);
+    const status = await spApiRequest(`/reports/2021-06-30/reports/${reportId}`) as Record<string, unknown>;
+    if (status.processingStatus === "DONE") {
+      reportDocId = status.reportDocumentId as string;
+      break;
+    }
+    if (status.processingStatus === "CANCELLED" || status.processingStatus === "FATAL") {
+      return { error: true, message: `Report ${status.processingStatus}`, data: status };
+    }
+  }
+
+  if (!reportDocId) {
+    return { error: true, message: "Report timed out after 60s" };
+  }
+
+  // Step 3: Get the report document URL
+  const docInfo = await spApiRequest(`/reports/2021-06-30/documents/${reportDocId}`) as Record<string, unknown>;
+  if (docInfo.error) return docInfo;
+
+  const downloadUrl = docInfo.url as string;
+  if (!downloadUrl) return { error: true, message: "No download URL in report document", data: docInfo };
+
+  // Step 4: Download and parse the TSV report
+  const dlRes = await fetch(downloadUrl);
+  const tsvText = await dlRes.text();
+  const rows = parseTsv(tsvText);
+
+  // Normalize to our listing format
+  const listings = rows
+    .filter((r) => r["status"] === "Active" || r["Status"] === "Active")
+    .map((r) => ({
+      asin: r["asin1"] || r["ASIN1"] || r["asin"] || "",
+      sku: r["seller-sku"] || r["Seller SKU"] || r["sku"] || "",
+      title: r["item-name"] || r["Title"] || r["item-description"] || "",
+      current_price: parseFloat(r["price"] || r["Price"] || "0"),
+      quantity: parseInt(r["quantity"] || r["Quantity"] || "0"),
+      status: "active",
+    }));
+
+  return { listings, totalRaw: rows.length };
 }
 
 async function handleGetCompetitivePrice(asin: string): Promise<unknown> {

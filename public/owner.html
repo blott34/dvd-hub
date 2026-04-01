@@ -637,30 +637,115 @@ function esc(s) {
   return el.innerHTML;
 }
 
-// ===== REPRICER: Mock Data & Engine =====
-const MOCK_LISTINGS = [
-  { asin: 'B00005JNOG', sku: 'DVD-001', title: 'The Shawshank Redemption (1994)', current_price: 12.99, min_price: 8.50, max_price: 24.99, cost_basis: 3.50, sales_rank: 45000, date_listed: '2026-02-15', last_sold: '2026-03-20T14:30:00Z', last_repriced: null, status: 'active' },
-  { asin: 'B00003CXCT', sku: 'DVD-002', title: 'The Godfather (1972)', current_price: 24.99, min_price: 8.50, max_price: 24.99, cost_basis: 4.00, sales_rank: 32000, date_listed: '2026-03-31', last_sold: null, last_repriced: null, status: 'active' },
-  { asin: 'B00005JMF8', sku: 'DVD-003', title: 'Pulp Fiction (1994)', current_price: 8.50, min_price: 8.50, max_price: 24.99, cost_basis: 2.75, sales_rank: 78000, date_listed: '2026-01-10', last_sold: '2026-02-05T09:15:00Z', last_repriced: '2026-03-01T12:00:00Z', status: 'active' },
-  { asin: 'B000P0J0AQ', sku: 'DVD-004', title: 'The Dark Knight (2008)', current_price: 15.49, min_price: 8.50, max_price: 24.99, cost_basis: 5.00, sales_rank: 120000, date_listed: '2026-03-01', last_sold: null, last_repriced: null, status: 'active' },
-  { asin: 'B001AQO3QA', sku: 'DVD-005', title: 'Forrest Gump (1994)', current_price: 10.99, min_price: 8.50, max_price: 24.99, cost_basis: 3.00, sales_rank: 650000, date_listed: '2026-02-01', last_sold: null, last_repriced: '2026-03-15T08:00:00Z', status: 'active' },
-  { asin: 'B00AEFYIKQ', sku: 'DVD-006', title: 'Inception (2010)', current_price: 18.75, min_price: 8.50, max_price: 24.99, cost_basis: 4.50, sales_rank: 95000, date_listed: '2026-03-10', last_sold: '2026-03-25T16:45:00Z', last_repriced: null, status: 'active' },
-  { asin: 'B003EYIZ1G', sku: 'DVD-007', title: 'The Matrix (1999)', current_price: 9.25, min_price: 8.50, max_price: 24.99, cost_basis: 8.00, sales_rank: 210000, date_listed: '2026-01-20', last_sold: '2026-02-28T11:00:00Z', last_repriced: '2026-03-10T10:30:00Z', status: 'active' },
-  { asin: 'B00G4RKQ0M', sku: 'DVD-008', title: 'Interstellar (2014)', current_price: 22.00, min_price: 8.50, max_price: 24.99, cost_basis: 6.00, sales_rank: 55000, date_listed: '2026-03-20', last_sold: null, last_repriced: null, status: 'active' },
-  { asin: 'B005LAIINI', sku: 'DVD-009', title: 'Goodfellas (1990)', current_price: 14.00, min_price: 8.50, max_price: 24.99, cost_basis: 3.25, sales_rank: 180000, date_listed: '2026-02-10', last_sold: null, last_repriced: null, status: 'active' },
-  { asin: 'B00K19SD8Q', sku: 'DVD-010', title: 'Guardians of the Galaxy (2014)', current_price: 11.50, min_price: 8.50, max_price: 24.99, cost_basis: 4.25, sales_rank: 88000, date_listed: '2026-03-05', last_sold: '2026-03-28T13:20:00Z', last_repriced: '2026-03-25T09:00:00Z', status: 'active' },
-];
+// ===== REPRICER: SP-API Edge Function + Supabase Data =====
+async function callSpApi(action, params = {}) {
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/sp-api`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+    },
+    body: JSON.stringify({ action, ...params }),
+  });
+  return res.json();
+}
 
-let repricerListings = JSON.parse(JSON.stringify(MOCK_LISTINGS));
+// Load listings from Supabase listings table (local data with min/max/cost_basis)
+async function loadListingsFromDb() {
+  return await query('listings', 'select=*&status=eq.active&order=sku.asc');
+}
+
+// Load repricing log from Supabase
+async function loadRepricingLog() {
+  return await query('repricing_log', 'select=*&order=timestamp.desc&limit=50');
+}
+
+// Load repricing rules from Supabase
+async function loadRepricingRules() {
+  return await query('repricing_rules', 'select=*&order=id.asc');
+}
+
+// Save a repricing log entry to Supabase
+async function saveLogEntry(entry) {
+  await fetch(`${SUPABASE_URL}/rest/v1/repricing_log`, {
+    method: 'POST',
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(entry),
+  });
+}
+
+// Update a listing in Supabase
+async function updateListingInDb(id, updates) {
+  await fetch(`${SUPABASE_URL}/rest/v1/listings?id=eq.${id}`, {
+    method: 'PATCH',
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(updates),
+  });
+}
+
+// Toggle rule in Supabase
+async function updateRuleInDb(id, updates) {
+  await fetch(`${SUPABASE_URL}/rest/v1/repricing_rules?id=eq.${id}`, {
+    method: 'PATCH',
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(updates),
+  });
+}
+
+let repricerListings = [];
 let repricerLog = [];
+let repricerDataSource = 'db'; // 'db' or 'mock'
+let repricerLoading = false;
 
-const REPRICER_RULES = [
+let REPRICER_RULES = [
   { id: 1, rule_name: 'Default Floors', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: null, notes: 'Min $8.50, Max $24.99 for all listings unless overridden' },
   { id: 2, rule_name: 'Max Hit Day 1', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: 3.00, target_position: null, notes: 'If listing hits max price on day 1, raise max by configured amount' },
   { id: 3, rule_name: 'Stale Inventory', is_active: true, days_before_drop: 30, drop_amount: 0.50, max_hit_raise_amount: null, target_position: null, notes: 'Drop min price after configured days without a sale' },
   { id: 4, rule_name: 'Never Below Cost', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: null, notes: 'No rule can drop price below cost_basis' },
   { id: 5, rule_name: 'Sales Rank Guard', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: 500000, notes: 'Do not reprice downward if sales rank above threshold' },
 ];
+
+// Load repricer data from Supabase on dashboard load
+async function initRepricerData() {
+  try {
+    // Try loading from Supabase tables
+    const [dbListings, dbLog, dbRules] = await Promise.all([
+      loadListingsFromDb(),
+      loadRepricingLog(),
+      loadRepricingRules(),
+    ]);
+
+    if (Array.isArray(dbListings) && dbListings.length > 0) {
+      repricerListings = dbListings;
+      repricerDataSource = 'db';
+    } else {
+      repricerDataSource = 'empty';
+    }
+
+    if (Array.isArray(dbLog)) {
+      repricerLog = dbLog;
+    }
+
+    if (Array.isArray(dbRules) && dbRules.length > 0) {
+      REPRICER_RULES = dbRules;
+    }
+  } catch (e) {
+    console.warn('Repricer DB load failed, using defaults:', e);
+    repricerDataSource = 'empty';
+  }
+}
 
 function runRepricerEngine() {
   const now = new Date();
@@ -798,7 +883,11 @@ function renderRepricer() {
         </div>
         <div class="repricer-actions">
           <button class="btn-reprice primary" onclick="handleRunRepricer()">Run Repricing Engine</button>
-          <button class="btn-reprice secondary" onclick="handleResetRepricer()">Reset Mock Data</button>
+          <button class="btn-reprice secondary" id="btn-sync-amazon" onclick="handleSyncFromAmazon()">Sync from Amazon</button>
+          <button class="btn-reprice secondary" onclick="handleRefreshFromDb()">Refresh from DB</button>
+          <span style="font-size:12px;color:#666;align-self:center;margin-left:8px;">
+            Source: ${repricerDataSource === 'db' ? '<span style="color:#22ff55;">Supabase DB</span> (' + repricerListings.length + ' listings)' : '<span style="color:#ffaa00;">No listings in DB yet</span> — click Sync from Amazon'}
+          </span>
         </div>
         <div class="repricer-status" id="repricer-status"></div>
         <!-- Quick log preview -->
@@ -925,41 +1014,137 @@ function switchRepricerTab(tab) {
 
 function toggleRule(index, active) {
   REPRICER_RULES[index].is_active = active;
+  if (REPRICER_RULES[index].id) {
+    updateRuleInDb(REPRICER_RULES[index].id, { is_active: active });
+  }
 }
 
 function updateRuleField(index, field, value) {
-  REPRICER_RULES[index][field] = parseFloat(value) || parseInt(value) || 0;
+  const parsed = parseFloat(value) || parseInt(value) || 0;
+  REPRICER_RULES[index][field] = parsed;
+  if (REPRICER_RULES[index].id) {
+    updateRuleInDb(REPRICER_RULES[index].id, { [field]: parsed });
+  }
 }
 
-function handleRunRepricer() {
+async function handleRunRepricer() {
+  const btn = document.querySelector('.btn-reprice.primary');
+  if (btn) { btn.disabled = true; btn.textContent = 'Running...'; }
+
   const entries = runRepricerEngine();
+
+  // Persist changes to Supabase if data came from DB
+  if (repricerDataSource === 'db') {
+    for (const entry of entries) {
+      await saveLogEntry({
+        asin: entry.asin,
+        sku: entry.sku,
+        old_price: entry.old_price,
+        new_price: entry.new_price,
+        reason: entry.reason,
+      });
+      const listing = repricerListings.find(l => l.sku === entry.sku);
+      if (listing && listing.id) {
+        await updateListingInDb(listing.id, {
+          current_price: entry.new_price,
+          last_repriced: entry.timestamp,
+        });
+      }
+    }
+    // Reload log from DB
+    const freshLog = await loadRepricingLog();
+    if (Array.isArray(freshLog)) repricerLog = freshLog;
+  }
+
   const section = document.getElementById('repricer-section');
-  const parent = section.parentElement;
   section.outerHTML = renderRepricer();
-  // Show status
   const status = document.getElementById('repricer-status');
   if (entries.length > 0) {
     status.className = 'repricer-status success';
-    status.textContent = 'Engine complete: ' + entries.length + ' price change' + (entries.length !== 1 ? 's' : '') + ' applied.';
+    status.textContent = 'Engine complete: ' + entries.length + ' price change' + (entries.length !== 1 ? 's' : '') + ' applied' + (repricerDataSource === 'db' ? ' and saved to database.' : '.');
   } else {
     status.className = 'repricer-status info';
     status.textContent = 'Engine complete: no price changes needed.';
   }
 }
 
-function handleResetRepricer() {
-  repricerListings = JSON.parse(JSON.stringify(MOCK_LISTINGS));
-  repricerLog = [];
-  REPRICER_RULES[0].is_active = true;
-  REPRICER_RULES[1].is_active = true; REPRICER_RULES[1].max_hit_raise_amount = 3.00;
-  REPRICER_RULES[2].is_active = true; REPRICER_RULES[2].days_before_drop = 30; REPRICER_RULES[2].drop_amount = 0.50;
-  REPRICER_RULES[3].is_active = true;
-  REPRICER_RULES[4].is_active = true; REPRICER_RULES[4].target_position = 500000;
+async function handleSyncFromAmazon() {
+  const btn = document.getElementById('btn-sync-amazon');
+  if (btn) { btn.disabled = true; btn.textContent = 'Syncing from Amazon... (may take up to 60s)'; }
+  const status = document.getElementById('repricer-status');
+  if (status) { status.className = 'repricer-status info'; status.style.display = 'block'; status.textContent = 'Requesting listings report from Amazon SP-API...'; }
+
+  try {
+    const result = await callSpApi('fetchListings');
+
+    if (result.error) {
+      if (status) { status.className = 'repricer-status'; status.style.display = 'block'; status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.textContent = 'Amazon sync error: ' + (result.message || JSON.stringify(result)); }
+      if (btn) { btn.disabled = false; btn.textContent = 'Sync from Amazon'; }
+      return;
+    }
+
+    const amazonListings = result.listings || [];
+    if (status) { status.textContent = 'Got ' + amazonListings.length + ' active listings from Amazon. Syncing to database...'; }
+
+    // Upsert each listing into Supabase (merge with existing data)
+    for (const al of amazonListings) {
+      if (!al.sku || !al.asin) continue;
+      const existing = repricerListings.find(l => l.sku === al.sku);
+      if (existing) {
+        // Update price and title from Amazon, keep local min/max/cost_basis
+        await updateListingInDb(existing.id, {
+          current_price: al.current_price,
+          title: al.title,
+          asin: al.asin,
+        });
+      } else {
+        // Insert new listing
+        await fetch(`${SUPABASE_URL}/rest/v1/listings`, {
+          method: 'POST',
+          headers: {
+            'apikey': SUPABASE_KEY,
+            'Authorization': `Bearer ${SUPABASE_KEY}`,
+            'Content-Type': 'application/json',
+            'Prefer': 'return=minimal',
+          },
+          body: JSON.stringify({
+            asin: al.asin,
+            sku: al.sku,
+            title: al.title,
+            current_price: al.current_price || 0,
+            min_price: 8.50,
+            max_price: 24.99,
+            cost_basis: 0,
+            status: 'active',
+          }),
+        });
+      }
+    }
+
+    // Reload from DB
+    await initRepricerData();
+    const section = document.getElementById('repricer-section');
+    section.outerHTML = renderRepricer();
+    const newStatus = document.getElementById('repricer-status');
+    if (newStatus) {
+      newStatus.className = 'repricer-status success';
+      newStatus.textContent = 'Amazon sync complete: ' + amazonListings.length + ' listings synced.';
+    }
+  } catch (e) {
+    if (status) { status.className = 'repricer-status'; status.style.display = 'block'; status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.textContent = 'Sync error: ' + e.message; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Sync from Amazon'; }
+  }
+}
+
+async function handleRefreshFromDb() {
+  await initRepricerData();
   const section = document.getElementById('repricer-section');
   section.outerHTML = renderRepricer();
   const status = document.getElementById('repricer-status');
-  status.className = 'repricer-status info';
-  status.textContent = 'Mock data reset to defaults.';
+  if (status) {
+    status.className = 'repricer-status info';
+    status.textContent = 'Reloaded ' + repricerListings.length + ' listings from database.';
+  }
 }
 
 async function loadDashboard() {
@@ -967,6 +1152,9 @@ async function loadDashboard() {
   const sod = startOfDayISO();
   const pp = getPayPeriod();
   const weekStart = getWeekStart();
+
+  // Initialize repricer data from Supabase
+  await initRepricerData();
 
   const [
     todayLogs, ppLogs, shipDoneToday, shipDonePP,
