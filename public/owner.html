@@ -407,15 +407,16 @@
   .rule-card {
     background: #111111;
     border-radius: 8px;
-    padding: 16px 20px;
+    padding: 20px 24px;
     display: flex;
+    justify-content: space-between;
     align-items: flex-start;
-    gap: 16px;
+    gap: 24px;
   }
 
   .rule-toggle {
     flex-shrink: 0;
-    margin-top: 2px;
+    padding-top: 2px;
   }
 
   .toggle-switch {
@@ -460,7 +461,7 @@
     background: #fff;
   }
 
-  .rule-info { flex: 1; }
+  .rule-info { flex: 1; min-width: 0; }
   .rule-name { font-weight: 600; font-size: 15px; color: #fff; margin-bottom: 4px; }
   .rule-desc { font-size: 13px; color: #888; margin-bottom: 8px; }
 
@@ -939,12 +940,6 @@ function renderRepricer() {
         <div class="rules-list">
           ${REPRICER_RULES.map((rule, i) => `
             <div class="rule-card">
-              <div class="rule-toggle">
-                <label class="toggle-switch">
-                  <input type="checkbox" ${rule.is_active ? 'checked' : ''} onchange="toggleRule(${i}, this.checked)">
-                  <span class="toggle-slider"></span>
-                </label>
-              </div>
               <div class="rule-info">
                 <div class="rule-name">${esc(rule.rule_name)}</div>
                 <div class="rule-desc">${esc(rule.notes)}</div>
@@ -972,6 +967,12 @@ function renderRepricer() {
                     </div>
                   ` : ''}
                 </div>
+              </div>
+              <div class="rule-toggle">
+                <label class="toggle-switch">
+                  <input type="checkbox" ${rule.is_active ? 'checked' : ''} onchange="toggleRule(${i}, this.checked)">
+                  <span class="toggle-slider"></span>
+                </label>
               </div>
             </div>
           `).join('')}
