@@ -209,10 +209,12 @@ async function handleGetCompetitivePriceBatch(asins: string[]): Promise<unknown>
 async function handleUpdatePrice(sku: string, price: number): Promise<unknown> {
   const sellerId = Deno.env.get("SP_API_SELLER_ID") || "";
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
+  const encodedSku = encodeURIComponent(sku);
+  const priceStr = price.toFixed(2);
 
-  // Listings Items API — PATCH to update price attribute
+  // Listings Items API 2021-08-01 — PATCH to update price
   const body = {
-    productType: "PRODUCT",
+    productType: "HOME_VIDEO",
     patches: [
       {
         op: "replace",
@@ -225,7 +227,7 @@ async function handleUpdatePrice(sku: string, price: number): Promise<unknown> {
               {
                 schedule: [
                   {
-                    value_with_tax: price.toFixed(2),
+                    value_with_tax: priceStr,
                   },
                 ],
               },
@@ -237,7 +239,7 @@ async function handleUpdatePrice(sku: string, price: number): Promise<unknown> {
   };
 
   const result = await spApiRequest(
-    `/listings/2021-08-01/items/${sellerId}/${encodeURIComponent(sku)}?marketplaceIds=${marketplaceId}`,
+    `/listings/2021-08-01/items/${sellerId}/${encodedSku}?marketplaceIds=${marketplaceId}&issueLocale=en_US`,
     "PATCH",
     body
   );
