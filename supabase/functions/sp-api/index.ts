@@ -122,22 +122,6 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function parseTsv(tsv: string): Record<string, string>[] {
-  const lines = tsv.trim().split("\n");
-  if (lines.length < 2) return [];
-  const headers = lines[0].split("\t").map((h) => h.trim());
-  const rows: Record<string, string>[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split("\t");
-    const row: Record<string, string> = {};
-    for (let j = 0; j < headers.length; j++) {
-      row[headers[j]] = (cols[j] || "").trim();
-    }
-    rows.push(row);
-  }
-  return rows;
-}
-
 // ---- Action Handlers ----
 
 async function handleFetchListings(): Promise<unknown> {
@@ -145,100 +129,68 @@ async function handleFetchListings(): Promise<unknown> {
   const sellerId = getActiveSellerId();
 
   console.log("========================================");
-  console.log("=== FETCH LISTINGS ===");
+  console.log("=== FETCH LISTINGS (Inventory Summaries API) ===");
   console.log("Seller ID:", sellerId);
   console.log("Marketplace:", marketplaceId);
   console.log("========================================");
 
-  // Step 1: Request a GET_MERCHANT_LISTINGS_ALL_DATA report
-  console.log("Step 1: Creating report...");
-  const createRes = await spApiRequest("/reports/2021-06-30/reports", "POST", {
-    reportType: "GET_MERCHANT_LISTINGS_ALL_DATA",
-    marketplaceIds: [marketplaceId],
-  }) as Record<string, unknown>;
-
-  if (createRes.error) {
-    console.error("Report creation failed:", JSON.stringify(createRes));
-    return createRes;
-  }
-  const reportId = createRes.reportId as string;
-  if (!reportId) return { error: true, message: "No reportId returned", data: createRes };
-  console.log("Report created:", reportId);
-
-  // Step 2: Poll until report is done (max ~90s)
-  let reportDocId: string | null = null;
-  for (let i = 0; i < 30; i++) {
-    await sleep(3000);
-    const status = await spApiRequest(`/reports/2021-06-30/reports/${reportId}`) as Record<string, unknown>;
-    console.log(`Poll ${i + 1}: ${status.processingStatus}`);
-    if (status.processingStatus === "DONE") {
-      reportDocId = status.reportDocumentId as string;
-      break;
-    }
-    if (status.processingStatus === "CANCELLED" || status.processingStatus === "FATAL") {
-      return { error: true, message: `Report ${status.processingStatus}`, data: status };
-    }
-  }
-
-  if (!reportDocId) {
-    return { error: true, message: "Report timed out after 90s" };
-  }
-  console.log("Report document ID:", reportDocId);
-
-  // Step 3: Get the report document URL
-  const docInfo = await spApiRequest(`/reports/2021-06-30/documents/${reportDocId}`) as Record<string, unknown>;
-  if (docInfo.error) return docInfo;
-
-  const downloadUrl = docInfo.url as string;
-  if (!downloadUrl) return { error: true, message: "No download URL in report document", data: docInfo };
-
-  // Step 4: Download and parse the TSV report
-  console.log("Downloading report...");
-  const dlRes = await fetch(downloadUrl);
-  const tsvText = await dlRes.text();
-  const rows = parseTsv(tsvText);
-
-  console.log("========================================");
-  console.log("=== REPORT PARSED ===");
-  console.log("Total rows:", rows.length);
-  if (rows.length > 0) {
-    console.log("Column headers:", Object.keys(rows[0]).join(", "));
-    console.log("First row sample:", JSON.stringify(rows[0]));
-  }
-  console.log("========================================");
-
   const skuFilter = /dvdbox|wiibox/i;
+  const listings: { asin: string; sku: string; title: string; current_price: number; quantity: number; status: string; sales_rank: number | null }[] = [];
+  let nextToken: string | null = null;
+  let totalRaw = 0;
+  let pageCount = 0;
 
-  // Filter to active DVDBOX/WIIBOX listings
-  const filtered = rows
-    .filter((r) => {
-      const st = r["status"] || r["Status"] || "";
-      return st === "Active";
-    })
-    .filter((r) => {
-      const sku = r["seller-sku"] || r["Seller SKU"] || r["sku"] || "";
-      return skuFilter.test(sku);
-    });
+  // Step 1: Fetch all inventory via FBA Inventory Summaries API (paginated, instant)
+  console.log("Step 1: Fetching inventory summaries...");
+  do {
+    let inventoryUrl = `/fba/inventory/v1/summaries?details=true&granularityType=Marketplace&granularityId=${marketplaceId}&marketplaceIds=${marketplaceId}`;
+    if (nextToken) {
+      inventoryUrl += `&nextToken=${encodeURIComponent(nextToken)}`;
+    }
 
-  console.log("Active DVDBOX/WIIBOX listings:", filtered.length);
+    const invRes = await spApiRequest(inventoryUrl) as Record<string, unknown>;
 
-  // Build listing objects
-  const listings = filtered.map((r) => ({
-    asin: r["asin1"] || r["ASIN1"] || r["asin"] || "",
-    sku: r["seller-sku"] || r["Seller SKU"] || r["sku"] || "",
-    title: r["item-name"] || r["Title"] || r["item-description"] || "",
-    current_price: parseFloat(r["price"] || r["Price"] || "0"),
-    quantity: parseInt(r["quantity"] || r["Quantity"] || "0"),
-    status: "active",
-    sales_rank: null as number | null,
-  }));
+    if (invRes.error) {
+      console.error("Inventory Summaries API failed:", JSON.stringify(invRes));
+      return invRes;
+    }
 
-  // Log each listing found
+    const payload = invRes.payload as Record<string, unknown> | undefined;
+    const summaries = payload?.inventorySummaries as Array<Record<string, unknown>> | undefined;
+    const pagination = invRes.pagination as Record<string, unknown> | undefined;
+
+    if (summaries && Array.isArray(summaries)) {
+      totalRaw += summaries.length;
+      for (const item of summaries) {
+        const sku = (item.sellerSku || "") as string;
+        if (!skuFilter.test(sku)) continue;
+        const qty = (item.totalQuantity || 0) as number;
+        if (qty <= 0) continue;
+
+        listings.push({
+          asin: (item.asin || "") as string,
+          sku,
+          title: (item.productName || "") as string,
+          current_price: 0,
+          quantity: qty,
+          status: "active",
+          sales_rank: null,
+        });
+      }
+    }
+
+    nextToken = pagination?.nextToken as string | null || null;
+    pageCount++;
+    console.log(`  Page ${pageCount}: ${summaries?.length || 0} items, ${listings.length} DVDBOX/WIIBOX so far`);
+  } while (nextToken);
+
+  console.log("Active DVDBOX/WIIBOX listings:", listings.length);
+
   for (const l of listings) {
-    console.log(`  [${l.sku}] ${l.asin} — $${l.current_price} — "${l.title.substring(0, 60)}"`);
+    console.log(`  [${l.sku}] ${l.asin} — "${l.title.substring(0, 60)}"`);
   }
 
-  // Step 5: Batch-fetch sales ranks from Catalog Items API (5 at a time to stay under rate limits)
+  // Step 2: Batch-fetch sales ranks from Catalog Items API (5 at a time)
   const asins = [...new Set(listings.map((l) => l.asin).filter(Boolean))];
   console.log("========================================");
   console.log("=== FETCHING SALES RANKS for", asins.length, "ASINs ===");
@@ -248,7 +200,6 @@ async function handleFetchListings(): Promise<unknown> {
   const BATCH_SIZE = 5;
   for (let i = 0; i < asins.length; i += BATCH_SIZE) {
     const batch = asins.slice(i, i + BATCH_SIZE);
-    // Catalog Items API only supports single-ASIN lookups, run in parallel within batch
     const promises = batch.map(async (asin) => {
       try {
         const catRes = await spApiRequest(
@@ -258,7 +209,6 @@ async function handleFetchListings(): Promise<unknown> {
         if (catRes && !catRes.error) {
           const salesRanks = catRes.salesRanks as Array<Record<string, unknown>> | undefined;
           if (salesRanks && salesRanks.length > 0) {
-            // Find the primary (display group "DVD" or first available) rank
             const primary = salesRanks[0];
             const ranks = primary.ranks as Array<{ rank?: number; value?: number }> | undefined;
             if (ranks && ranks.length > 0) {
@@ -275,29 +225,22 @@ async function handleFetchListings(): Promise<unknown> {
       }
     });
     await Promise.all(promises);
-
-    // Small delay between batches to respect rate limits
-    if (i + BATCH_SIZE < asins.length) {
-      await sleep(500);
-    }
+    if (i + BATCH_SIZE < asins.length) await sleep(500);
   }
 
-  // Merge sales ranks into listings
   for (const listing of listings) {
     if (listing.asin && salesRankMap[listing.asin] !== undefined) {
       listing.sales_rank = salesRankMap[listing.asin];
     }
   }
 
-  // Step 6: Fetch real-time prices via Pricing API (GET /products/pricing/v0/price?Skus=...)
-  // The report price can be stale — this gives the actual current listing price.
+  // Step 3: Fetch real-time prices via Pricing API (20 SKUs per batch)
   const skus = listings.map((l) => l.sku).filter(Boolean);
   console.log("========================================");
   console.log("=== FETCHING REAL-TIME PRICES for", skus.length, "SKUs ===");
   console.log("========================================");
 
   const livePriceMap: Record<string, number> = {};
-  // Pricing API supports up to 20 SKUs per request
   const PRICE_BATCH = 20;
   for (let i = 0; i < skus.length; i += PRICE_BATCH) {
     const batch = skus.slice(i, i + PRICE_BATCH);
@@ -307,28 +250,17 @@ async function handleFetchListings(): Promise<unknown> {
         `/products/pricing/v0/price?MarketplaceId=${marketplaceId}&Skus=${skuParam}&ItemType=Sku`
       ) as Record<string, unknown>;
 
-      console.log("Pricing API response for batch", Math.floor(i / PRICE_BATCH) + 1 + ":");
-      console.log(JSON.stringify(priceRes, null, 2));
-
-      // Response: { payload: [ { status: "Success", SKU, Product: { Offers: [{ BuyingPrice: { ListingPrice: { Amount } } }] } } ] }
       const payload = priceRes.payload as Array<Record<string, unknown>> | undefined;
       if (payload && Array.isArray(payload)) {
         for (const item of payload) {
           const itemStatus = item.status as string || item.Status as string || "";
           const sku = (item.SKU || item.SellerSKU || item.seller_sku || item.sku) as string;
-          if (!sku) continue;
+          if (!sku || itemStatus !== "Success") continue;
 
-          if (itemStatus !== "Success") {
-            console.log(`  [${sku}] Pricing status: ${itemStatus}`);
-            continue;
-          }
-
-          // Extract price from multiple possible response paths
           const product = item.Product as Record<string, unknown> | undefined;
           let livePrice: number | null = null;
 
           if (product) {
-            // Path 1: Product.Offers[].BuyingPrice.ListingPrice.Amount
             const offers = product.Offers as Array<Record<string, unknown>> | undefined;
             if (offers && offers.length > 0) {
               const buyingPrice = offers[0].BuyingPrice as Record<string, unknown> | undefined;
@@ -339,7 +271,6 @@ async function handleFetchListings(): Promise<unknown> {
                   if (amt > 0) livePrice = amt;
                 }
               }
-              // Path 2: Product.Offers[].RegularPrice.Amount
               if (livePrice === null) {
                 const regularPrice = offers[0].RegularPrice as Record<string, unknown> | undefined;
                 if (regularPrice) {
@@ -353,30 +284,18 @@ async function handleFetchListings(): Promise<unknown> {
           if (livePrice !== null) {
             livePriceMap[sku] = livePrice;
             console.log(`  [${sku}] Live price: $${livePrice.toFixed(2)}`);
-          } else {
-            console.log(`  [${sku}] Could not extract price from response`);
           }
         }
       }
     } catch (err) {
       console.warn("Pricing API batch failed:", err);
     }
-
-    if (i + PRICE_BATCH < skus.length) {
-      await sleep(500);
-    }
+    if (i + PRICE_BATCH < skus.length) await sleep(500);
   }
 
-  // Override report prices with live prices
-  let pricesUpdated = 0;
   for (const listing of listings) {
     if (listing.sku && livePriceMap[listing.sku] !== undefined) {
-      const reportPrice = listing.current_price;
       listing.current_price = livePriceMap[listing.sku];
-      if (reportPrice !== listing.current_price) {
-        console.log(`  [${listing.sku}] Price updated: $${reportPrice.toFixed(2)} (report) → $${listing.current_price.toFixed(2)} (live)`);
-        pricesUpdated++;
-      }
     }
   }
 
@@ -384,11 +303,10 @@ async function handleFetchListings(): Promise<unknown> {
   console.log("=== SYNC COMPLETE ===");
   console.log("Listings with sales rank:", listings.filter((l) => l.sales_rank !== null).length);
   console.log("Listings with live price:", Object.keys(livePriceMap).length);
-  console.log("Prices changed from report:", pricesUpdated);
   console.log("Total listings returned:", listings.length);
   console.log("========================================");
 
-  return { listings, totalRaw: rows.length, salesRanksFound: Object.keys(salesRankMap).length, livePricesFound: Object.keys(livePriceMap).length, pricesUpdated };
+  return { listings, totalRaw, salesRanksFound: Object.keys(salesRankMap).length, livePricesFound: Object.keys(livePriceMap).length };
 }
 
 async function handleGetCompetitivePrice(asin: string): Promise<unknown> {

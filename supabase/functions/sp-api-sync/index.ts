@@ -1,8 +1,10 @@
 // Supabase Edge Function: sp-api-sync
-// Long-running background sync job that pulls all DVDBOX/WIIBOX listings
-// from Amazon via Reports API, fetches live prices via Pricing API,
-// fetches sales ranks via Catalog Items API, and upserts into Supabase.
+// Fast sync using FBA Inventory Summaries API (no Reports API).
+// Fetches all active inventory, filters to DVDBOX/WIIBOX, then batch-fetches
+// live prices and sales ranks. Progressive upsert — partial results are saved
+// as they come in so even a timeout yields useful data.
 //
+// Target: complete within 60 seconds.
 // Called by the sp-api function's "startSync" action.
 // Progress is tracked in the sync_status table.
 
@@ -13,6 +15,9 @@ const SP_API_BASE = "https://sellingpartnerapi-na.amazon.com";
 const LWA_TOKEN_URL = "https://api.amazon.com/auth/o2/token";
 const CONFIRMED_SELLER_ID = "A1TXEW03NQ1VT4";
 const SKU_FILTER = /dvdbox|wiibox/i;
+
+// Hard timeout — stop fetching after this many ms to leave time for final upsert
+const SYNC_DEADLINE_MS = 55_000;
 
 let cachedToken: { token: string; expiresAt: number } | null = null;
 
@@ -63,27 +68,12 @@ async function getAccessToken(): Promise<string> {
 async function spApiGet(path: string): Promise<unknown> {
   const token = await getAccessToken();
   const url = `${SP_API_BASE}${path}`;
+  console.log("GET", url);
   const res = await fetch(url, {
     headers: {
       "x-amz-access-token": token,
       "Content-Type": "application/json",
     },
-  });
-  const body = await res.text();
-  if (!res.ok) return { error: true, status: res.status, message: body };
-  try { return JSON.parse(body); } catch { return { raw: body }; }
-}
-
-async function spApiPost(path: string, data: unknown): Promise<unknown> {
-  const token = await getAccessToken();
-  const url = `${SP_API_BASE}${path}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "x-amz-access-token": token,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(data),
   });
   const body = await res.text();
   if (!res.ok) return { error: true, status: res.status, message: body };
@@ -94,34 +84,29 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function parseTsv(tsv: string): Record<string, string>[] {
-  const lines = tsv.trim().split("\n");
-  if (lines.length < 2) return [];
-  const headers = lines[0].split("\t").map((h) => h.trim());
-  const rows: Record<string, string>[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split("\t");
-    const row: Record<string, string> = {};
-    for (let j = 0; j < headers.length; j++) {
-      row[headers[j]] = (cols[j] || "").trim();
-    }
-    rows.push(row);
-  }
-  return rows;
+function isOverDeadline(startTime: number): boolean {
+  return Date.now() - startTime > SYNC_DEADLINE_MS;
 }
 
 // ---- Main sync logic ----
 
+interface InventoryListing {
+  asin: string;
+  sku: string;
+  title: string;
+  current_price: number;
+  sales_rank: number | null;
+  quantity: number;
+}
+
 async function runSync(jobId: string) {
   const sb = getSupabaseAdmin();
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
+  const startTime = Date.now();
 
   const appendLog = async (msg: string) => {
     console.log(msg);
-    // Append to log field
-    await sb.rpc("sync_append_log", { job_id: jobId, msg: msg + "\n" }).catch(() => {
-      // Fallback: direct update if RPC doesn't exist
-    });
+    await sb.rpc("sync_append_log", { job_id: jobId, msg: msg + "\n" }).catch(() => {});
   };
 
   const updateStatus = async (fields: Record<string, unknown>) => {
@@ -129,100 +114,131 @@ async function runSync(jobId: string) {
   };
 
   try {
-    await appendLog("Starting sync for seller " + CONFIRMED_SELLER_ID);
+    await appendLog("Starting fast sync (Inventory Summaries API)");
 
-    // Step 1: Create report
-    await appendLog("Step 1: Creating GET_MERCHANT_LISTINGS_ALL_DATA report...");
-    const createRes = await spApiPost("/reports/2021-06-30/reports", {
-      reportType: "GET_MERCHANT_LISTINGS_ALL_DATA",
-      marketplaceIds: [marketplaceId],
-    }) as Record<string, unknown>;
+    // ==========================================
+    // Step 1: Fetch all inventory via FBA Inventory Summaries API
+    // This is paginated and returns results immediately — no report generation.
+    // ==========================================
+    await appendLog("Step 1: Fetching inventory summaries...");
 
-    if (createRes.error) {
-      await updateStatus({ status: "failed", completed_at: new Date().toISOString(), error_message: "Report creation failed: " + JSON.stringify(createRes) });
-      return;
-    }
+    const allListings: InventoryListing[] = [];
+    let nextToken: string | null = null;
+    let pageCount = 0;
+    let totalRaw = 0;
 
-    const reportId = createRes.reportId as string;
-    if (!reportId) {
-      await updateStatus({ status: "failed", completed_at: new Date().toISOString(), error_message: "No reportId returned" });
-      return;
-    }
-    await appendLog("Report created: " + reportId);
-
-    // Step 2: Poll until done (max ~3 minutes)
-    await appendLog("Step 2: Polling for report completion...");
-    let reportDocId: string | null = null;
-    for (let i = 0; i < 60; i++) {
-      await sleep(3000);
-      const status = await spApiGet(`/reports/2021-06-30/reports/${reportId}`) as Record<string, unknown>;
-      const ps = status.processingStatus as string;
-      if (i % 5 === 0) await appendLog("  Poll " + (i + 1) + ": " + ps);
-      if (ps === "DONE") {
-        reportDocId = status.reportDocumentId as string;
+    do {
+      if (isOverDeadline(startTime)) {
+        await appendLog("Deadline approaching during inventory fetch — proceeding with " + allListings.length + " listings");
         break;
       }
-      if (ps === "CANCELLED" || ps === "FATAL") {
-        await updateStatus({ status: "failed", completed_at: new Date().toISOString(), error_message: "Report " + ps });
-        return;
+
+      let inventoryUrl = `/fba/inventory/v1/summaries?details=true&granularityType=Marketplace&granularityId=${marketplaceId}&marketplaceIds=${marketplaceId}`;
+      if (nextToken) {
+        inventoryUrl += `&nextToken=${encodeURIComponent(nextToken)}`;
+      }
+
+      const invRes = await spApiGet(inventoryUrl) as Record<string, unknown>;
+
+      if (invRes.error) {
+        // If FBA Inventory API fails (e.g., not enrolled), fall back to DB-only refresh
+        await appendLog("Inventory Summaries API failed: " + JSON.stringify(invRes).substring(0, 300));
+        await appendLog("Falling back to DB-based refresh (prices + ranks only)...");
+        break;
+      }
+
+      const payload = invRes.payload as Record<string, unknown> | undefined;
+      const summaries = payload?.inventorySummaries as Array<Record<string, unknown>> | undefined;
+      const pagination = invRes.pagination as Record<string, unknown> | undefined;
+
+      if (summaries && Array.isArray(summaries)) {
+        totalRaw += summaries.length;
+
+        for (const item of summaries) {
+          const sku = (item.sellerSku || "") as string;
+          if (!SKU_FILTER.test(sku)) continue;
+          const qty = (item.totalQuantity || 0) as number;
+          if (qty <= 0) continue; // skip out-of-stock
+
+          allListings.push({
+            asin: (item.asin || "") as string,
+            sku,
+            title: (item.productName || "") as string,
+            current_price: 0, // will be filled by Pricing API
+            sales_rank: null,
+            quantity: qty,
+          });
+        }
+      }
+
+      nextToken = pagination?.nextToken as string | null || null;
+      pageCount++;
+      await appendLog("  Page " + pageCount + ": " + (summaries?.length || 0) + " items, " + allListings.length + " DVDBOX/WIIBOX so far");
+
+    } while (nextToken);
+
+    await updateStatus({ total_raw: totalRaw });
+
+    // If Inventory API returned nothing, fall back to refreshing existing DB listings
+    let usingDbFallback = false;
+    if (allListings.length === 0) {
+      await appendLog("No listings from Inventory API — refreshing existing DB listings");
+      usingDbFallback = true;
+
+      const { data: dbListings } = await sb
+        .from("listings")
+        .select("asin, sku, title, current_price, sales_rank, status")
+        .eq("status", "active");
+
+      if (dbListings && dbListings.length > 0) {
+        for (const l of dbListings) {
+          if (SKU_FILTER.test(l.sku)) {
+            allListings.push({
+              asin: l.asin,
+              sku: l.sku,
+              title: l.title,
+              current_price: l.current_price || 0,
+              sales_rank: l.sales_rank,
+              quantity: 1,
+            });
+          }
+        }
+        await appendLog("Loaded " + allListings.length + " listings from DB for refresh");
       }
     }
 
-    if (!reportDocId) {
-      await updateStatus({ status: "failed", completed_at: new Date().toISOString(), error_message: "Report timed out after 3 minutes" });
-      return;
-    }
-    await appendLog("Report ready: " + reportDocId);
-
-    // Step 3: Download report
-    await appendLog("Step 3: Downloading report...");
-    const docInfo = await spApiGet(`/reports/2021-06-30/documents/${reportDocId}`) as Record<string, unknown>;
-    if (docInfo.error) {
-      await updateStatus({ status: "failed", completed_at: new Date().toISOString(), error_message: "Doc fetch failed: " + JSON.stringify(docInfo) });
-      return;
-    }
-
-    const downloadUrl = docInfo.url as string;
-    if (!downloadUrl) {
-      await updateStatus({ status: "failed", completed_at: new Date().toISOString(), error_message: "No download URL" });
-      return;
-    }
-
-    const dlRes = await fetch(downloadUrl);
-    const tsvText = await dlRes.text();
-    const rows = parseTsv(tsvText);
-    await updateStatus({ total_raw: rows.length });
-    await appendLog("Report parsed: " + rows.length + " total rows");
-
-    // Step 4: Filter to DVDBOX/WIIBOX active listings
-    const filtered = rows
-      .filter((r) => (r["status"] || r["Status"] || "") === "Active")
-      .filter((r) => {
-        const sku = r["seller-sku"] || r["Seller SKU"] || r["sku"] || "";
-        return SKU_FILTER.test(sku);
+    if (allListings.length === 0) {
+      await updateStatus({
+        status: "complete",
+        completed_at: new Date().toISOString(),
+        listings_synced: 0,
+        prices_fetched: 0,
+        ranks_fetched: 0,
       });
+      await appendLog("No listings to sync");
+      return;
+    }
 
-    await appendLog("Active DVDBOX/WIIBOX: " + filtered.length + " listings");
+    await appendLog("Total DVDBOX/WIIBOX listings: " + allListings.length);
 
-    const listings = filtered.map((r) => ({
-      asin: r["asin1"] || r["ASIN1"] || r["asin"] || "",
-      sku: r["seller-sku"] || r["Seller SKU"] || r["sku"] || "",
-      title: r["item-name"] || r["Title"] || r["item-description"] || "",
-      report_price: parseFloat(r["price"] || r["Price"] || "0"),
-      current_price: parseFloat(r["price"] || r["Price"] || "0"),
-      quantity: parseInt(r["quantity"] || r["Quantity"] || "0"),
-      sales_rank: null as number | null,
-    }));
-
-    // Step 5: Fetch live prices via Pricing API (20 SKUs per batch)
-    await appendLog("Step 5: Fetching live prices...");
-    const skus = listings.map((l) => l.sku).filter(Boolean);
-    const livePriceMap: Record<string, number> = {};
+    // ==========================================
+    // Step 2: Batch-fetch live prices via Pricing API (20 SKUs per batch)
+    // Progressive: upsert after each batch so partial data is saved.
+    // ==========================================
+    await appendLog("Step 2: Fetching live prices...");
+    const skus = allListings.map((l) => l.sku).filter(Boolean);
+    let pricesFetched = 0;
     const PRICE_BATCH = 20;
 
     for (let i = 0; i < skus.length; i += PRICE_BATCH) {
+      if (isOverDeadline(startTime)) {
+        await appendLog("Deadline approaching during price fetch — got " + pricesFetched + " prices");
+        break;
+      }
+
       const batch = skus.slice(i, i + PRICE_BATCH);
       const skuParam = batch.map((s) => encodeURIComponent(s)).join("&Skus=");
+
       try {
         const priceRes = await spApiGet(
           `/products/pricing/v0/price?MarketplaceId=${marketplaceId}&Skus=${skuParam}&ItemType=Sku`
@@ -241,7 +257,6 @@ async function runSync(jobId: string) {
             const offers = product.Offers as Array<Record<string, unknown>> | undefined;
             if (!offers || offers.length === 0) continue;
 
-            // Try BuyingPrice.ListingPrice.Amount first, then RegularPrice.Amount
             let livePrice: number | null = null;
             const buyingPrice = offers[0].BuyingPrice as Record<string, unknown> | undefined;
             if (buyingPrice) {
@@ -259,33 +274,40 @@ async function runSync(jobId: string) {
               }
             }
 
-            if (livePrice !== null) livePriceMap[sku] = livePrice;
+            if (livePrice !== null) {
+              const listing = allListings.find((l) => l.sku === sku);
+              if (listing) {
+                listing.current_price = livePrice;
+                pricesFetched++;
+              }
+            }
           }
         }
       } catch (err) {
         console.warn("Pricing batch failed:", err);
       }
 
-      if (i + PRICE_BATCH < skus.length) await sleep(500);
+      await updateStatus({ prices_fetched: pricesFetched });
+
+      if (i + PRICE_BATCH < skus.length) await sleep(200);
     }
 
-    await appendLog("Live prices fetched: " + Object.keys(livePriceMap).length + " / " + skus.length);
-    await updateStatus({ prices_fetched: Object.keys(livePriceMap).length });
+    await appendLog("Live prices fetched: " + pricesFetched + " / " + skus.length);
 
-    // Override report prices with live prices
-    for (const listing of listings) {
-      if (listing.sku && livePriceMap[listing.sku] !== undefined) {
-        listing.current_price = livePriceMap[listing.sku];
-      }
-    }
-
-    // Step 6: Fetch sales ranks (5 at a time)
-    await appendLog("Step 6: Fetching sales ranks...");
-    const asins = [...new Set(listings.map((l) => l.asin).filter(Boolean))];
-    const salesRankMap: Record<string, number> = {};
+    // ==========================================
+    // Step 3: Batch-fetch sales ranks via Catalog Items API (5 at a time)
+    // ==========================================
+    await appendLog("Step 3: Fetching sales ranks...");
+    const asins = [...new Set(allListings.map((l) => l.asin).filter(Boolean))];
+    let ranksFetched = 0;
     const RANK_BATCH = 5;
 
     for (let i = 0; i < asins.length; i += RANK_BATCH) {
+      if (isOverDeadline(startTime)) {
+        await appendLog("Deadline approaching during rank fetch — got " + ranksFetched + " ranks");
+        break;
+      }
+
       const batch = asins.slice(i, i + RANK_BATCH);
       const promises = batch.map(async (asin) => {
         try {
@@ -299,7 +321,13 @@ async function runSync(jobId: string) {
               const ranks = salesRanks[0].ranks as Array<{ rank?: number; value?: number }> | undefined;
               if (ranks && ranks.length > 0) {
                 const rank = ranks[0].rank ?? ranks[0].value;
-                if (typeof rank === "number") salesRankMap[asin] = rank;
+                if (typeof rank === "number") {
+                  // Apply rank to all listings with this ASIN
+                  for (const l of allListings) {
+                    if (l.asin === asin) l.sales_rank = rank;
+                  }
+                  ranksFetched++;
+                }
               }
             }
           }
@@ -308,35 +336,36 @@ async function runSync(jobId: string) {
         }
       });
       await Promise.all(promises);
-      if (i + RANK_BATCH < asins.length) await sleep(500);
+
+      await updateStatus({ ranks_fetched: ranksFetched });
+
+      if (i + RANK_BATCH < asins.length) await sleep(200);
     }
 
-    await appendLog("Sales ranks fetched: " + Object.keys(salesRankMap).length + " / " + asins.length);
-    await updateStatus({ ranks_fetched: Object.keys(salesRankMap).length });
+    await appendLog("Sales ranks fetched: " + ranksFetched + " / " + asins.length);
 
-    // Merge ranks
-    for (const listing of listings) {
-      if (listing.asin && salesRankMap[listing.asin] !== undefined) {
-        listing.sales_rank = salesRankMap[listing.asin];
-      }
-    }
-
-    // Step 7: Upsert into Supabase listings table
-    await appendLog("Step 7: Upserting " + listings.length + " listings into database...");
+    // ==========================================
+    // Step 4: Upsert all listings into Supabase
+    // ==========================================
+    await appendLog("Step 4: Upserting " + allListings.length + " listings...");
     let synced = 0;
-
-    // Batch upsert 50 at a time
     const UPSERT_BATCH = 50;
-    for (let i = 0; i < listings.length; i += UPSERT_BATCH) {
-      const batch = listings.slice(i, i + UPSERT_BATCH);
-      const rows = batch.map((l) => ({
-        asin: l.asin,
-        sku: l.sku,
-        title: l.title,
-        current_price: l.current_price,
-        sales_rank: l.sales_rank,
-        status: "active",
-      }));
+
+    for (let i = 0; i < allListings.length; i += UPSERT_BATCH) {
+      const batch = allListings.slice(i, i + UPSERT_BATCH);
+      const rows = batch.map((l) => {
+        const row: Record<string, unknown> = {
+          asin: l.asin,
+          sku: l.sku,
+          title: l.title,
+          status: "active",
+        };
+        // Only update price if we got a live price (> 0)
+        if (l.current_price > 0) row.current_price = l.current_price;
+        // Only update rank if we got one
+        if (l.sales_rank !== null) row.sales_rank = l.sales_rank;
+        return row;
+      });
 
       const { error } = await sb
         .from("listings")
@@ -351,7 +380,9 @@ async function runSync(jobId: string) {
       await updateStatus({ listings_synced: synced });
     }
 
-    await appendLog("Sync complete: " + synced + " listings upserted");
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    await appendLog("Sync complete in " + elapsed + "s: " + synced + " listings, " + pricesFetched + " prices, " + ranksFetched + " ranks");
+
     await updateStatus({
       status: "complete",
       completed_at: new Date().toISOString(),
@@ -385,18 +416,8 @@ serve(async (req: Request) => {
     const { jobId } = await req.json();
     if (!jobId) throw new Error("Missing jobId");
 
-    // Run sync in the background — respond immediately
-    // Use EdgeRuntime.waitUntil if available, otherwise just fire and forget
+    // Run sync — respond immediately if EdgeRuntime.waitUntil is available
     const syncPromise = runSync(jobId);
-
-    // Deno edge functions: we need to await or the function exits
-    // But we already responded. Use a pattern that keeps the function alive.
-    // Actually in Supabase edge functions, we must await — the function stays
-    // alive until the response is sent AND all promises resolve.
-    // So we run sync and respond after it completes... but that defeats the purpose.
-    //
-    // Better approach: respond immediately and keep the function alive with waitUntil.
-    // Supabase Edge Functions support this via EdgeRuntime.waitUntil()
 
     // deno-lint-ignore no-explicit-any
     const runtime = (globalThis as any).EdgeRuntime;
@@ -407,7 +428,7 @@ serve(async (req: Request) => {
       });
     }
 
-    // Fallback: just run sync (will be long but won't timeout if Supabase allows it)
+    // Fallback: run synchronously
     await syncPromise;
     return new Response(JSON.stringify({ ok: true, jobId, note: "sync completed synchronously" }), {
       headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" },
