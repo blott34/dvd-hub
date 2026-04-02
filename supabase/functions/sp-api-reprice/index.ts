@@ -257,11 +257,13 @@ async function runAutoReprice() {
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
 
   // Step 0: Check if auto-reprice is enabled
-  const { data: settings } = await sb
+  const { data: settings, error: settingsErr } = await sb
     .from("auto_reprice_settings")
     .select("enabled")
     .eq("id", 1)
     .single();
+
+  console.log("Auto-reprice settings query:", JSON.stringify({ settings, error: settingsErr?.message }));
 
   if (!settings || !settings.enabled) {
     console.log("Auto-reprice is disabled. Skipping.");
@@ -285,17 +287,24 @@ async function runAutoReprice() {
 
   try {
     // Step 1: Load active DVDBOX/WIIBOX listings from Supabase
-    const { data: listings, error: listErr } = await sb
+    // Supabase JS client defaults to 1000 rows — use range to get all
+    const { data: listings, error: listErr, count: listCount } = await sb
       .from("listings")
-      .select("*")
+      .select("*", { count: "exact" })
       .eq("status", "active")
-      .or("sku.ilike.%dvdbox%,sku.ilike.%wiibox%");
+      .or("sku.ilike.%dvdbox%,sku.ilike.%wiibox%")
+      .range(0, 4999);
+
+    console.log("Listings query result — count:", listCount, "rows returned:", listings?.length, "error:", listErr?.message || "none");
 
     if (listErr) throw new Error("Failed to load listings: " + listErr.message);
 
     const activeListings = (listings || []) as Listing[];
 
     console.log("Active DVDBOX/WIIBOX listings:", activeListings.length);
+    if (activeListings.length > 0) {
+      console.log("Sample listing:", JSON.stringify(activeListings[0]));
+    }
 
     if (activeListings.length === 0) {
       await sb.from("reprice_runs").update({

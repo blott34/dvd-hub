@@ -136,7 +136,8 @@ async function handleFetchListings(): Promise<unknown> {
     .select("*")
     .eq("status", "active")
     .or("sku.ilike.%dvdbox%,sku.ilike.%wiibox%")
-    .order("sku", { ascending: true });
+    .order("sku", { ascending: true })
+    .range(0, 4999);
 
   if (error) {
     return { error: true, message: error.message };

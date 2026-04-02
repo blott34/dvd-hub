@@ -707,7 +707,14 @@ async function callSpApi(action, params = {}) {
 
 // Load listings from Supabase listings table (local data with min/max/cost_basis)
 async function loadListingsFromDb() {
-  return await query('listings', 'select=*&status=eq.active&or=(sku.ilike.*dvdbox*,sku.ilike.*wiibox*)&order=sku.asc&limit=5000');
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/listings?select=*&status=eq.active&or=(sku.ilike.*dvdbox*,sku.ilike.*wiibox*)&order=sku.asc`, {
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Range': '0-4999',
+    },
+  });
+  return res.json();
 }
 
 // Load repricing log from Supabase
