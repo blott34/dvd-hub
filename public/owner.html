@@ -707,7 +707,7 @@ async function callSpApi(action, params = {}) {
 
 // Load listings from Supabase listings table (local data with min/max/cost_basis)
 async function loadListingsFromDb() {
-  return await query('listings', 'select=*&status=eq.active&or=(sku.ilike.*dvdbox*,sku.ilike.*wiibox*)&order=sku.asc');
+  return await query('listings', 'select=*&status=eq.active&or=(sku.ilike.*dvdbox*,sku.ilike.*wiibox*)&order=sku.asc&limit=5000');
 }
 
 // Load repricing log from Supabase
@@ -932,8 +932,9 @@ function renderRepricer() {
             <div class="ar-val">${nextSync.toLocaleString()}</div>
             <div class="ar-lbl">Next Sync</div>
           </div>
-          <div class="auto-reprice-stat">
+          <div class="auto-reprice-stat" style="display:flex;gap:8px;">
             <button class="btn-reprice secondary" id="btn-daily-sync" onclick="handleTriggerDailySync()" style="padding:8px 16px;font-size:12px;">Sync Now</button>
+            <button class="btn-reprice secondary" onclick="handleRefreshFromDb()" style="padding:8px 16px;font-size:12px;">Refresh from DB</button>
           </div>
         </div>
       </div>
@@ -1201,6 +1202,17 @@ async function pollSyncStatus(jobId) {
 
   } catch (e) {
     console.warn('Poll error:', e);
+  }
+}
+
+async function handleRefreshFromDb() {
+  await initRepricerData();
+  const section = document.getElementById('repricer-section');
+  section.outerHTML = renderRepricer();
+  const status = document.getElementById('sync-status');
+  if (status) {
+    status.className = 'repricer-status info';
+    status.textContent = 'Reloaded ' + repricerListings.length + ' listings from database.';
   }
 }
 
