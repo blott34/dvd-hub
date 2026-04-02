@@ -155,11 +155,11 @@ function runRepricingEngine(
       const dateListed = new Date(listing.date_listed + "T00:00:00");
       const daysSinceListed = Math.floor((now.getTime() - dateListed.getTime()) / 86400000);
       const raiseAmount = parseFloat(String(maxHitRule.max_hit_raise_amount)) || 3.0;
-      if (daysSinceListed <= 1 && listing.current_price >= listing.max_price) {
+      if (daysSinceListed === 0 && listing.current_price >= listing.max_price) {
         listing.max_price = parseFloat((listing.max_price + raiseAmount).toFixed(2));
       }
-      // Also: if day 1 and Buy Box is above max, raise max to match Buy Box
-      if (daysSinceListed <= 1) {
+      // Also: if day 0 and Buy Box is above max, raise max to match Buy Box
+      if (daysSinceListed === 0) {
         const bbData = buyBoxPrices[listing.asin];
         const bbPrice = bbData ? bbData.buyBox : null;
         if (bbPrice != null && bbPrice > listing.max_price) {

@@ -772,6 +772,22 @@ async function loadLatestRepriceRun() {
   return await query('reprice_runs', 'select=*&order=started_at.desc&limit=1');
 }
 
+// Load active listing count via HEAD request (not capped at 1000)
+async function loadActiveListingCount() {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/listings?select=id&status=eq.active&or=(sku.ilike.*dvdbox*,sku.ilike.*wiibox*)`, {
+    method: 'HEAD',
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Range': '0-0',
+      'Prefer': 'count=exact',
+    },
+  });
+  const range = res.headers.get('content-range') || '';
+  const match = range.match(/\/(\d+)$/);
+  return match ? parseInt(match[1]) : 0;
+}
+
 // Toggle auto-reprice enabled/disabled
 async function setAutoRepriceEnabled(enabled) {
   await fetch(`${SUPABASE_URL}/rest/v1/auto_reprice_settings?id=eq.1`, {
@@ -831,6 +847,7 @@ let autoRepriceEnabled = true;
 let liveMode = false;
 let lastRepriceRun = null;
 let lastDailySync = null;
+let activeListingCount = 0;
 let currentOwnerTab = 'home';
 
 function switchOwnerTab(tab) {
@@ -860,14 +877,17 @@ async function loadLatestDailySync() {
 // Load repricer data from Supabase on dashboard load
 async function initRepricerData() {
   try {
-    const [dbListings, dbLog, dbRules, arSettings, arRun, syncStatus] = await Promise.all([
+    const [dbListings, dbLog, dbRules, arSettings, arRun, syncStatus, listingCount] = await Promise.all([
       loadListingsFromDb(),
       loadRepricingLog(),
       loadRepricingRules(),
       loadAutoRepriceSettings(),
       loadLatestRepriceRun(),
       loadLatestDailySync(),
+      loadActiveListingCount(),
     ]);
+
+    activeListingCount = listingCount;
 
     if (Array.isArray(dbListings) && dbListings.length > 0) {
       repricerListings = dbListings;
@@ -978,7 +998,7 @@ function renderRepricer() {
         </div>
         <div class="auto-reprice-stats">
           <div class="auto-reprice-stat">
-            <div class="ar-val blue">${active.length}</div>
+            <div class="ar-val blue">${activeListingCount}</div>
             <div class="ar-lbl">Total Listings</div>
           </div>
           <div class="auto-reprice-stat">
@@ -1018,7 +1038,7 @@ function renderRepricer() {
       <div class="repricer-tab active" id="repricer-overview">
         <div class="repricer-summary">
           <div class="stat">
-            <div class="stat-val blue">${active.length}</div>
+            <div class="stat-val blue">${activeListingCount}</div>
             <div class="stat-lbl">Active Listings</div>
           </div>
           <div class="stat">
