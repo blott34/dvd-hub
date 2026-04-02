@@ -1,10 +1,17 @@
 // Supabase Edge Function: sp-api-sync
-// SKU-based sync — accepts a list of SKUs, looks up each via Listings Items API
-// and Pricing API, then upserts into the listings table.
-// Processes in batches of 10 with progress tracking.
+// Full listing discovery using Amazon Reports API (GET_MERCHANT_LISTINGS_ALL_DATA).
+// Triggered daily at 6am ET by pg_cron, or manually from the owner dashboard.
 //
-// Called by the sp-api function's "startSync" action.
-// Can also be called directly with a list of SKUs for manual import.
+// Flow:
+//   1. Request GET_MERCHANT_LISTINGS_ALL_DATA report
+//   2. Poll until report is DONE (no timeout — runs in background)
+//   3. Download and parse TSV
+//   4. Filter to DVDBOX/WIIBOX SKUs
+//   5. Batch-fetch prices via Pricing API
+//   6. Batch-fetch sales ranks via Catalog Items API
+//   7. Upsert all active listings into the listings table
+//   8. Mark any existing DB listings NOT in the report as inactive
+//
 // Progress is tracked in the sync_status table.
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
@@ -76,8 +83,75 @@ async function spApiGet(path: string): Promise<unknown> {
   try { return JSON.parse(body); } catch { return { raw: body }; }
 }
 
+async function spApiPost(path: string, body: unknown): Promise<unknown> {
+  const token = await getAccessToken();
+  const url = `${SP_API_BASE}${path}`;
+  console.log("POST", url);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "x-amz-access-token": token,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const responseBody = await res.text();
+  if (!res.ok) return { error: true, status: res.status, message: responseBody };
+  try { return JSON.parse(responseBody); } catch { return { raw: responseBody }; }
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---- TSV Parser ----
+
+interface TsvListing {
+  sku: string;
+  asin: string;
+  title: string;
+  price: number;
+  status: string;
+}
+
+function parseTsv(tsv: string): TsvListing[] {
+  const lines = tsv.split("\n");
+  if (lines.length < 2) return [];
+
+  const headers = lines[0].split("\t").map((h) => h.trim().toLowerCase().replace(/[- ]/g, "_"));
+
+  // Find column indices — Amazon report columns vary, handle common names
+  const skuIdx = headers.findIndex((h) => h === "seller_sku" || h === "sku");
+  const asinIdx = headers.findIndex((h) => h === "asin1" || h === "asin");
+  const titleIdx = headers.findIndex((h) => h === "item_name" || h === "title" || h === "product_name");
+  const priceIdx = headers.findIndex((h) => h === "price" || h === "your_price" || h === "current_price");
+  const statusIdx = headers.findIndex((h) => h === "status" || h === "listing_status" || h === "item_status");
+
+  if (skuIdx === -1) {
+    console.warn("TSV headers:", headers.join(", "));
+    throw new Error("Could not find SKU column in report TSV. Headers: " + headers.slice(0, 10).join(", "));
+  }
+
+  const results: TsvListing[] = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    const cols = line.split("\t");
+    const sku = (cols[skuIdx] || "").trim();
+    if (!sku) continue;
+
+    results.push({
+      sku,
+      asin: asinIdx >= 0 ? (cols[asinIdx] || "").trim() : "",
+      title: titleIdx >= 0 ? (cols[titleIdx] || "").trim() : "",
+      price: priceIdx >= 0 ? parseFloat(cols[priceIdx] || "0") || 0 : 0,
+      status: statusIdx >= 0 ? (cols[statusIdx] || "Active").trim() : "Active",
+    });
+  }
+
+  return results;
 }
 
 // ---- Main sync logic ----
@@ -90,7 +164,7 @@ interface SyncedListing {
   sales_rank: number | null;
 }
 
-async function runSync(jobId: string, skus?: string[]) {
+async function runSync(jobId: string) {
   const sb = getSupabaseAdmin();
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
 
@@ -104,126 +178,128 @@ async function runSync(jobId: string, skus?: string[]) {
   };
 
   try {
-    // Determine which SKUs to sync
-    let skusToSync: string[] = [];
+    // ==========================================
+    // Step 1: Request the GET_MERCHANT_LISTINGS_ALL_DATA report
+    // ==========================================
+    await appendLog("Step 1: Requesting GET_MERCHANT_LISTINGS_ALL_DATA report...");
 
-    if (skus && skus.length > 0) {
-      // Manual import — use provided SKUs
-      skusToSync = skus.filter((s) => SKU_FILTER.test(s));
-      await appendLog("Manual import: " + skusToSync.length + " valid SKUs provided");
-    } else {
-      // Refresh mode — reload all existing SKUs from the database
-      await appendLog("Refresh mode: loading existing SKUs from database...");
-      const { data: dbListings } = await sb
-        .from("listings")
-        .select("sku")
-        .eq("status", "active")
-        .or("sku.ilike.%dvdbox%,sku.ilike.%wiibox%");
+    const createReportRes = await spApiPost("/reports/2021-06-30/reports", {
+      reportType: "GET_MERCHANT_LISTINGS_ALL_DATA",
+      marketplaceIds: [marketplaceId],
+    }) as Record<string, unknown>;
 
-      if (dbListings && dbListings.length > 0) {
-        skusToSync = dbListings.map((l: { sku: string }) => l.sku);
-        await appendLog("Found " + skusToSync.length + " existing SKUs to refresh");
-      } else {
-        await appendLog("No existing listings in DB. Use Import SKUs to add listings.");
-        await updateStatus({
-          status: "complete",
-          completed_at: new Date().toISOString(),
-          listings_synced: 0,
-          prices_fetched: 0,
-          ranks_fetched: 0,
-        });
-        return;
+    if (createReportRes.error) {
+      throw new Error("Failed to create report: " + JSON.stringify(createReportRes));
+    }
+
+    const reportId = createReportRes.reportId as string;
+    if (!reportId) {
+      throw new Error("No reportId returned: " + JSON.stringify(createReportRes));
+    }
+
+    await appendLog("Report requested: " + reportId);
+
+    // ==========================================
+    // Step 2: Poll until report is DONE
+    // ==========================================
+    await appendLog("Step 2: Waiting for report to complete...");
+
+    let reportDocId: string | null = null;
+    let pollCount = 0;
+    const MAX_POLLS = 120; // Up to 20 minutes (10s intervals)
+
+    while (pollCount < MAX_POLLS) {
+      await sleep(10_000); // Wait 10 seconds between polls
+      pollCount++;
+
+      const statusRes = await spApiGet(`/reports/2021-06-30/reports/${reportId}`) as Record<string, unknown>;
+
+      if (statusRes.error) {
+        await appendLog("  Poll error: " + JSON.stringify(statusRes).substring(0, 200));
+        continue;
       }
+
+      const processingStatus = statusRes.processingStatus as string;
+      await appendLog("  Poll " + pollCount + ": status=" + processingStatus);
+
+      if (processingStatus === "DONE") {
+        reportDocId = statusRes.reportDocumentId as string;
+        break;
+      } else if (processingStatus === "CANCELLED" || processingStatus === "FATAL") {
+        throw new Error("Report failed with status: " + processingStatus);
+      }
+      // IN_QUEUE or IN_PROGRESS — keep polling
     }
 
-    await updateStatus({ total_raw: skusToSync.length });
-
-    // ==========================================
-    // Step 1: Look up each SKU via Listings Items API to get ASIN + title
-    // Process 10 at a time to avoid throttling
-    // ==========================================
-    await appendLog("Step 1: Looking up " + skusToSync.length + " SKUs via Listings Items API...");
-    const results: SyncedListing[] = [];
-    const LOOKUP_BATCH = 10;
-    let lookupsDone = 0;
-    let lookupsFailed = 0;
-
-    for (let i = 0; i < skusToSync.length; i += LOOKUP_BATCH) {
-      const batch = skusToSync.slice(i, i + LOOKUP_BATCH);
-
-      // Run batch in parallel (Listings Items API is per-SKU)
-      const promises = batch.map(async (sku) => {
-        try {
-          const encodedSku = encodeURIComponent(sku);
-          const res = await spApiGet(
-            `/listings/2021-08-01/items/${CONFIRMED_SELLER_ID}/${encodedSku}?marketplaceIds=${marketplaceId}&includedData=summaries`
-          ) as Record<string, unknown>;
-
-          if (res.error) {
-            console.warn(`  [${sku}] Listing lookup failed:`, (res.message as string || "").substring(0, 100));
-            lookupsFailed++;
-            return;
-          }
-
-          // Extract ASIN and title from summaries
-          const summaries = res.summaries as Array<Record<string, unknown>> | undefined;
-          let asin = "";
-          let title = "";
-
-          if (summaries && summaries.length > 0) {
-            asin = (summaries[0].asin || "") as string;
-            title = (summaries[0].itemName || "") as string;
-          }
-
-          if (!asin) {
-            // Try alternate response paths
-            asin = (res.asin || "") as string;
-          }
-
-          if (asin) {
-            results.push({
-              asin,
-              sku,
-              title,
-              current_price: 0,
-              sales_rank: null,
-            });
-            lookupsDone++;
-          } else {
-            console.warn(`  [${sku}] No ASIN found in response`);
-            lookupsFailed++;
-          }
-        } catch (err) {
-          console.warn(`  [${sku}] Lookup error:`, err);
-          lookupsFailed++;
-        }
-      });
-
-      await Promise.all(promises);
-      await appendLog("  Looked up " + (i + batch.length) + "/" + skusToSync.length + " SKUs (" + results.length + " found, " + lookupsFailed + " failed)");
-      await updateStatus({ listings_synced: results.length });
-
-      if (i + LOOKUP_BATCH < skusToSync.length) await sleep(300);
+    if (!reportDocId) {
+      throw new Error("Report did not complete after " + MAX_POLLS + " polls");
     }
 
-    await appendLog("Listings found: " + results.length + " / " + skusToSync.length);
+    await appendLog("Report complete. Document ID: " + reportDocId);
 
-    if (results.length === 0) {
+    // ==========================================
+    // Step 3: Download the report document
+    // ==========================================
+    await appendLog("Step 3: Downloading report document...");
+
+    const docRes = await spApiGet(`/reports/2021-06-30/documents/${reportDocId}`) as Record<string, unknown>;
+
+    if (docRes.error) {
+      throw new Error("Failed to get report document: " + JSON.stringify(docRes));
+    }
+
+    const downloadUrl = docRes.url as string;
+    if (!downloadUrl) {
+      throw new Error("No download URL in report document response");
+    }
+
+    const downloadRes = await fetch(downloadUrl);
+    if (!downloadRes.ok) {
+      throw new Error("Failed to download report: " + downloadRes.status);
+    }
+
+    const tsvContent = await downloadRes.text();
+    await appendLog("Report downloaded: " + tsvContent.length + " bytes");
+
+    // ==========================================
+    // Step 4: Parse TSV and filter to DVDBOX/WIIBOX
+    // ==========================================
+    await appendLog("Step 4: Parsing report and filtering to DVDBOX/WIIBOX...");
+
+    const allListings = parseTsv(tsvContent);
+    await appendLog("Total listings in report: " + allListings.length);
+
+    const filteredListings = allListings.filter((l) => SKU_FILTER.test(l.sku));
+    await appendLog("DVDBOX/WIIBOX listings: " + filteredListings.length);
+
+    await updateStatus({ total_raw: allListings.length });
+
+    if (filteredListings.length === 0) {
+      await appendLog("No DVDBOX/WIIBOX listings found in report.");
       await updateStatus({
-        status: lookupsFailed > 0 ? "failed" : "complete",
+        status: "complete",
         completed_at: new Date().toISOString(),
         listings_synced: 0,
         prices_fetched: 0,
         ranks_fetched: 0,
-        error_message: lookupsFailed > 0 ? lookupsFailed + " SKU lookups failed" : null,
       });
       return;
     }
 
+    // Build results array from parsed TSV
+    const results: SyncedListing[] = filteredListings.map((l) => ({
+      asin: l.asin,
+      sku: l.sku,
+      title: l.title,
+      current_price: l.price,
+      sales_rank: null,
+    }));
+
     // ==========================================
-    // Step 2: Batch-fetch live prices via Pricing API (20 SKUs per batch)
+    // Step 5: Batch-fetch live prices via Pricing API (20 SKUs per batch)
+    // For listings where the report price might be stale
     // ==========================================
-    await appendLog("Step 2: Fetching live prices...");
+    await appendLog("Step 5: Fetching live prices...");
     const priceSkus = results.map((l) => l.sku).filter(Boolean);
     let pricesFetched = 0;
     const PRICE_BATCH = 20;
@@ -287,9 +363,9 @@ async function runSync(jobId: string, skus?: string[]) {
     await appendLog("Prices fetched: " + pricesFetched + " / " + priceSkus.length);
 
     // ==========================================
-    // Step 3: Batch-fetch sales ranks via Catalog Items API (5 at a time)
+    // Step 6: Batch-fetch sales ranks via Catalog Items API (5 at a time)
     // ==========================================
-    await appendLog("Step 3: Fetching sales ranks...");
+    await appendLog("Step 6: Fetching sales ranks...");
     const asins = [...new Set(results.map((l) => l.asin).filter(Boolean))];
     let ranksFetched = 0;
     const RANK_BATCH = 5;
@@ -330,9 +406,9 @@ async function runSync(jobId: string, skus?: string[]) {
     await appendLog("Ranks fetched: " + ranksFetched + " / " + asins.length);
 
     // ==========================================
-    // Step 4: Upsert into Supabase
+    // Step 7: Upsert into Supabase
     // ==========================================
-    await appendLog("Step 4: Upserting " + results.length + " listings...");
+    await appendLog("Step 7: Upserting " + results.length + " listings...");
     let synced = 0;
     const UPSERT_BATCH = 50;
 
@@ -361,7 +437,33 @@ async function runSync(jobId: string, skus?: string[]) {
       }
     }
 
-    await appendLog("Sync complete: " + synced + " listings upserted, " + pricesFetched + " prices, " + ranksFetched + " ranks");
+    // ==========================================
+    // Step 8: Mark inactive listings not in the report
+    // ==========================================
+    await appendLog("Step 8: Marking inactive listings...");
+    const activeSKUs = new Set(results.map((l) => l.sku));
+
+    const { data: dbListings } = await sb
+      .from("listings")
+      .select("id, sku")
+      .eq("status", "active")
+      .or("sku.ilike.%dvdbox%,sku.ilike.%wiibox%");
+
+    let deactivated = 0;
+    if (dbListings) {
+      for (const dbListing of dbListings) {
+        if (!activeSKUs.has(dbListing.sku)) {
+          await sb.from("listings").update({ status: "inactive" }).eq("id", dbListing.id);
+          deactivated++;
+        }
+      }
+    }
+
+    if (deactivated > 0) {
+      await appendLog("Deactivated " + deactivated + " listings no longer in Amazon report.");
+    }
+
+    await appendLog("Sync complete: " + synced + " listings upserted, " + pricesFetched + " prices, " + ranksFetched + " ranks, " + deactivated + " deactivated");
     await updateStatus({
       status: "complete",
       completed_at: new Date().toISOString(),
@@ -371,6 +473,7 @@ async function runSync(jobId: string, skus?: string[]) {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("Sync failed:", msg);
+    await appendLog("ERROR: " + msg);
     await updateStatus({
       status: "failed",
       completed_at: new Date().toISOString(),
@@ -394,11 +497,10 @@ serve(async (req: Request) => {
   try {
     const body = await req.json();
     const jobId = body.jobId;
-    const skus = body.skus as string[] | undefined;
 
     if (!jobId) throw new Error("Missing jobId");
 
-    const syncPromise = runSync(jobId, skus);
+    const syncPromise = runSync(jobId);
 
     // deno-lint-ignore no-explicit-any
     const runtime = (globalThis as any).EdgeRuntime;

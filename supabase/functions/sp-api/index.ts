@@ -385,7 +385,7 @@ async function handleTestCatalog(asin: string): Promise<unknown> {
   return { action: "testCatalog", asin, result };
 }
 
-async function handleStartSync(skus?: string[]): Promise<unknown> {
+async function handleStartSync(): Promise<unknown> {
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const sb = createClient(supabaseUrl, serviceKey);
@@ -406,10 +406,6 @@ async function handleStartSync(skus?: string[]): Promise<unknown> {
 
   // Fire off the sp-api-sync function asynchronously
   const syncFnUrl = `${supabaseUrl}/functions/v1/sp-api-sync`;
-  const syncBody: Record<string, unknown> = { jobId };
-  if (skus && skus.length > 0) {
-    syncBody.skus = skus;
-  }
 
   fetch(syncFnUrl, {
     method: "POST",
@@ -417,12 +413,12 @@ async function handleStartSync(skus?: string[]): Promise<unknown> {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${serviceKey}`,
     },
-    body: JSON.stringify(syncBody),
+    body: JSON.stringify({ jobId }),
   }).catch((err) => {
     console.error("Failed to invoke sp-api-sync:", err);
   });
 
-  return { ok: true, jobId, message: skus ? "Import started (" + skus.length + " SKUs)" : "Sync started" };
+  return { ok: true, jobId, message: "Daily listing sync started" };
 }
 
 async function handleGetSyncStatus(jobId?: string): Promise<unknown> {
@@ -509,12 +505,7 @@ serve(async (req: Request) => {
         break;
 
       case "startSync":
-        result = await handleStartSync(params.skus);
-        break;
-
-      case "importSkus":
-        if (!params.skus?.length) throw new Error("Missing required param: skus[]");
-        result = await handleStartSync(params.skus);
+        result = await handleStartSync();
         break;
 
       case "getSyncStatus":
@@ -522,7 +513,7 @@ serve(async (req: Request) => {
         break;
 
       default:
-        throw new Error(`Unknown action: ${action}. Valid: fetchListings, getCompetitivePrice, getCompetitivePriceBatch, updatePrice, getSalesRank, getSalesRankBatch, getListingInfo, verifySeller, testCatalog, startSync, importSkus, getSyncStatus`);
+        throw new Error(`Unknown action: ${action}. Valid: fetchListings, getCompetitivePrice, getCompetitivePriceBatch, updatePrice, getSalesRank, getSalesRankBatch, getListingInfo, verifySeller, testCatalog, startSync, getSyncStatus`);
     }
 
     return new Response(JSON.stringify(result), {

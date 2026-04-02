@@ -784,15 +784,10 @@ async function updateRuleInDb(id, updates) {
 
 let repricerListings = [];
 let repricerLog = [];
-let repricerDataSource = 'db'; // 'db' or 'mock'
-let repricerLoading = false;
+let repricerDataSource = 'db';
 let autoRepriceEnabled = true;
 let lastRepriceRun = null;
-
-// ===== TEST MODE =====
-const TEST_SKUS = ['DVDBOX-1.05-01352', 'DVDBOX-1.05-01347', 'DVDBOX-1.05-01364'];
-let testBuyBoxPrices = {}; // asin -> buyBoxPrice
-let testResults = []; // last test run results
+let lastDailySync = null;
 
 let REPRICER_RULES = [
   { id: 0, rule_name: 'Match Buy Box', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: null, no_buybox_raise_amount: 1.00, notes: 'Match the Buy Box price within min/max bounds. If no Buy Box, raise price by configurable amount.' },
@@ -803,16 +798,21 @@ let REPRICER_RULES = [
   { id: 5, rule_name: 'Sales Rank Guard', is_active: true, days_before_drop: null, drop_amount: null, max_hit_raise_amount: null, target_position: 500000, no_buybox_raise_amount: null, notes: 'Do not reprice downward if sales rank above threshold' },
 ];
 
+// Load latest daily sync status
+async function loadLatestDailySync() {
+  return await query('sync_status', 'select=*&order=started_at.desc&limit=1');
+}
+
 // Load repricer data from Supabase on dashboard load
 async function initRepricerData() {
   try {
-    // Try loading from Supabase tables
-    const [dbListings, dbLog, dbRules, arSettings, arRun] = await Promise.all([
+    const [dbListings, dbLog, dbRules, arSettings, arRun, syncStatus] = await Promise.all([
       loadListingsFromDb(),
       loadRepricingLog(),
       loadRepricingRules(),
       loadAutoRepriceSettings(),
       loadLatestRepriceRun(),
+      loadLatestDailySync(),
     ]);
 
     if (Array.isArray(dbListings) && dbListings.length > 0) {
@@ -837,153 +837,23 @@ async function initRepricerData() {
     if (Array.isArray(arRun) && arRun.length > 0) {
       lastRepriceRun = arRun[0];
     }
+
+    if (Array.isArray(syncStatus) && syncStatus.length > 0) {
+      lastDailySync = syncStatus[0];
+    }
   } catch (e) {
     console.warn('Repricer DB load failed, using defaults:', e);
     repricerDataSource = 'empty';
   }
 }
 
-// buyBoxCache is populated by fetchBuyBoxForListings before engine runs
-let buyBoxCache = {};
-
-async function fetchBuyBoxForListings(listings) {
-  for (const l of listings) {
-    if (!l.asin) continue;
-    try {
-      const res = await callSpApi('getCompetitivePrice', { asin: l.asin });
-      if (res.payload && res.payload[0] && res.payload[0].Product) {
-        const prices = res.payload[0].Product.CompetitivePricing.CompetitivePrices || [];
-        const bb = prices.find(p => p.CompetitivePriceId === '1');
-        const low = prices.find(p => p.CompetitivePriceId === '2');
-        buyBoxCache[l.asin] = {
-          buyBox: bb ? bb.Price.LandedPrice.Amount : null,
-          lowest: low ? low.Price.LandedPrice.Amount : null,
-        };
-      } else {
-        buyBoxCache[l.asin] = { buyBox: null, lowest: null };
-      }
-    } catch (e) {
-      console.warn('Buy Box fetch failed for', l.asin, e);
-      buyBoxCache[l.asin] = { buyBox: null, lowest: null };
-    }
-  }
-}
-
-function runRepricerEngine() {
+function getNextSyncTime() {
+  // Daily sync runs at 10:00 UTC (6am ET)
   const now = new Date();
-  const newLogEntries = [];
-  const skuFilter = /dvdbox|wiibox/i;
-
-  for (const listing of repricerListings) {
-    if (listing.status !== 'active') continue;
-    if (!skuFilter.test(listing.sku)) continue;
-
-    let newPrice = listing.current_price;
-    let reason = null;
-
-    // Pre-pass: Adjust max (Max Hit Day 1)
-    const r2 = REPRICER_RULES.find(r => r.rule_name === 'Max Hit Day 1');
-    if (r2 && r2.is_active) {
-      const dateListed = new Date(listing.date_listed + 'T00:00:00');
-      const daysSinceListed = Math.floor((now - dateListed) / 86400000);
-      const raiseAmount = parseFloat(r2.max_hit_raise_amount) || 3.00;
-      if (daysSinceListed <= 1 && listing.current_price >= listing.max_price) {
-        listing.max_price = parseFloat((listing.max_price + raiseAmount).toFixed(2));
-      }
-    }
-
-    // Pre-pass: Adjust min (Stale Inventory)
-    const r3 = REPRICER_RULES.find(r => r.rule_name === 'Stale Inventory');
-    if (r3 && r3.is_active) {
-      const daysBefore = parseInt(r3.days_before_drop) || 30;
-      const dropAmount = parseFloat(r3.drop_amount) || 0.50;
-      const dateListed = new Date(listing.date_listed + 'T00:00:00');
-      const daysActive = Math.floor((now - dateListed) / 86400000);
-      const lastSold = listing.last_sold ? new Date(listing.last_sold) : null;
-      const daysSinceSale = lastSold ? Math.floor((now - lastSold) / 86400000) : daysActive;
-      if (daysSinceSale >= daysBefore) {
-        listing.min_price = parseFloat((listing.min_price - dropAmount).toFixed(2));
-      }
-    }
-
-    // Rule 0: Match Buy Box
-    const bbRule = REPRICER_RULES.find(r => r.rule_name === 'Match Buy Box');
-    if (bbRule && bbRule.is_active) {
-      const bbData = buyBoxCache[listing.asin];
-      const bbPrice = bbData ? bbData.buyBox : null;
-      const nobbRaise = parseFloat(bbRule.no_buybox_raise_amount) || 1.00;
-
-      if (bbPrice != null) {
-        if (bbPrice >= listing.min_price && bbPrice <= listing.max_price) {
-          newPrice = bbPrice;
-          reason = 'Match Buy Box: matched at $' + bbPrice.toFixed(2);
-        } else if (bbPrice < listing.min_price) {
-          newPrice = listing.min_price;
-          reason = 'Match Buy Box: BB $' + bbPrice.toFixed(2) + ' below min, set to min $' + listing.min_price.toFixed(2);
-        } else {
-          newPrice = listing.max_price;
-          reason = 'Match Buy Box: BB $' + bbPrice.toFixed(2) + ' above max, set to max $' + listing.max_price.toFixed(2);
-        }
-      } else {
-        const raised = Math.min(listing.current_price + nobbRaise, listing.max_price);
-        newPrice = parseFloat(raised.toFixed(2));
-        reason = 'No Buy Box - incremental raise of $' + nobbRaise.toFixed(2);
-      }
-    }
-
-    // Rule 1: Default Floors
-    const r1 = REPRICER_RULES.find(r => r.rule_name === 'Default Floors');
-    if (r1 && r1.is_active) {
-      if (newPrice < listing.min_price) {
-        newPrice = listing.min_price;
-        reason = 'Default Floors: price below minimum, raised to min';
-      }
-      if (newPrice > listing.max_price) {
-        newPrice = listing.max_price;
-        reason = 'Default Floors: price above maximum, lowered to max';
-      }
-    }
-
-    // Rule 4: Never Below Cost
-    const r4 = REPRICER_RULES.find(r => r.rule_name === 'Never Below Cost');
-    if (r4 && r4.is_active) {
-      if (newPrice < listing.cost_basis) {
-        newPrice = listing.cost_basis;
-        reason = 'Never Below Cost: price floored at cost basis $' + listing.cost_basis.toFixed(2);
-      }
-    }
-
-    // Rule 5: Sales Rank Guard
-    const r5 = REPRICER_RULES.find(r => r.rule_name === 'Sales Rank Guard');
-    if (r5 && r5.is_active) {
-      const threshold = parseInt(r5.target_position) || 500000;
-      if (listing.sales_rank > threshold && newPrice < listing.current_price) {
-        newPrice = listing.current_price;
-        reason = 'Sales Rank Guard: rank ' + listing.sales_rank.toLocaleString() + ' above ' + threshold.toLocaleString() + ', blocked downward reprice';
-      }
-    }
-
-    // Final bounds
-    newPrice = Math.max(newPrice, listing.min_price);
-    newPrice = Math.min(newPrice, listing.max_price);
-    newPrice = parseFloat(newPrice.toFixed(2));
-
-    if (newPrice !== listing.current_price) {
-      newLogEntries.push({
-        asin: listing.asin,
-        sku: listing.sku,
-        old_price: listing.current_price,
-        new_price: newPrice,
-        reason: reason || 'Price adjusted within bounds',
-        timestamp: now.toISOString(),
-      });
-      listing.current_price = newPrice;
-      listing.last_repriced = now.toISOString();
-    }
-  }
-
-  repricerLog = newLogEntries.concat(repricerLog).slice(0, 50);
-  return newLogEntries;
+  const next = new Date(now);
+  next.setUTCHours(10, 0, 0, 0);
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  return next;
 }
 
 function renderRepricer() {
@@ -994,6 +864,7 @@ function renderRepricer() {
     : '0.00';
   const atMin = active.filter(l => l.current_price <= l.min_price).length;
   const atMax = active.filter(l => l.current_price >= l.max_price).length;
+  const nextSync = getNextSyncTime();
 
   return `
     <section class="section" id="repricer-section">
@@ -1032,76 +903,51 @@ function renderRepricer() {
         </div>
       </div>
 
+      <!-- Daily Sync Status Bar -->
+      <div class="auto-reprice-bar" style="border:1px solid #2a2a2a;">
+        <div style="display:flex;align-items:center;gap:12px;">
+          <span style="font-weight:600;font-size:14px;color:#fff;">Daily Listing Sync</span>
+          <span style="font-size:12px;color:#888;">Every day at 6:00 AM ET</span>
+        </div>
+        <div class="auto-reprice-stats">
+          <div class="auto-reprice-stat">
+            <div class="ar-val blue">${active.length}</div>
+            <div class="ar-lbl">Total Listings</div>
+          </div>
+          <div class="auto-reprice-stat">
+            <div class="ar-val">${lastDailySync ? new Date(lastDailySync.started_at).toLocaleString() : '<span style="color:#666;">Never</span>'}</div>
+            <div class="ar-lbl">Last Sync</div>
+          </div>
+          ${lastDailySync ? `
+            <div class="auto-reprice-stat">
+              <div class="ar-val" style="color:${lastDailySync.status === 'complete' ? '#22ff55' : lastDailySync.status === 'running' ? '#44aaff' : '#ff4444'};">${lastDailySync.status === 'complete' ? 'OK' : lastDailySync.status === 'running' ? 'RUNNING' : 'FAILED'}</div>
+              <div class="ar-lbl">Status</div>
+            </div>
+            <div class="auto-reprice-stat">
+              <div class="ar-val">${lastDailySync.listings_synced || 0}</div>
+              <div class="ar-lbl">Synced</div>
+            </div>
+          ` : ''}
+          <div class="auto-reprice-stat">
+            <div class="ar-val">${nextSync.toLocaleString()}</div>
+            <div class="ar-lbl">Next Sync</div>
+          </div>
+          <div class="auto-reprice-stat">
+            <button class="btn-reprice secondary" id="btn-daily-sync" onclick="handleTriggerDailySync()" style="padding:8px 16px;font-size:12px;">Sync Now</button>
+          </div>
+        </div>
+      </div>
+      <div class="repricer-status" id="sync-status"></div>
+
       <div class="repricer-nav">
-        <button onclick="switchRepricerTab('test')" style="color:#ffcc00;border-bottom-color:#ffcc00;" class="active">Test Mode</button>
-        <button onclick="switchRepricerTab('overview')">Overview</button>
+        <button onclick="switchRepricerTab('overview')" class="active">Overview</button>
         <button onclick="switchRepricerTab('listings')">Listings</button>
         <button onclick="switchRepricerTab('rules')">Rules</button>
         <button onclick="switchRepricerTab('log')">Log</button>
       </div>
 
-      <!-- TEST MODE TAB -->
-      <div class="repricer-tab active" id="repricer-test">
-        <div style="padding:10px 16px;margin-bottom:14px;background:#1a1500;border:1px solid #4a3a00;border-radius:8px;font-size:13px;color:#ffcc00;">Test Mode — Only these 3 SKUs: ${TEST_SKUS.join(', ')}</div>
-        <div class="repricer-actions" style="margin-bottom:12px;">
-          <button class="btn-reprice primary" id="btn-test-reprice" onclick="handleRunTestReprice()">Run Test Reprice</button>
-          ${testResults.some(r => r.changed) ? '<button class="btn-reprice secondary" id="btn-push-amazon" onclick="handlePushToAmazon()" style="background:#ff6600;color:#fff;">Push Changes to Amazon</button>' : ''}
-          <button class="btn-reprice secondary" id="btn-force-push" onclick="handleForceTestPush()">Force Test Push</button>
-        </div>
-        <div class="repricer-status" id="test-status"></div>
-        ${(() => {
-          const tl = getTestListings();
-          if (tl.length === 0) return '<div class="empty">No test SKUs found in database. Click Sync from Amazon on the Overview tab first.</div>';
-          return '<div class="table-wrap"><table><thead><tr><th>SKU</th><th>Title</th><th>My Price</th><th>Buy Box</th><th>Diff</th><th>Min</th><th>Max</th><th>Sales Rank</th><th>Last Repriced</th></tr></thead><tbody>' +
-            tl.map(l => {
-              const bb = testBuyBoxPrices[l.asin];
-              const bbPrice = bb ? bb.buyBox : null;
-              const repriced = l.last_repriced ? new Date(l.last_repriced).toLocaleString() : '--';
-              let diffHtml = '<span style="color:#666;">--</span>';
-              if (bbPrice != null) {
-                const diff = l.current_price - bbPrice;
-                if (Math.abs(diff) < 0.01) diffHtml = '<span style="color:#22ff55;font-weight:600;">MATCHED</span>';
-                else if (diff > 0) diffHtml = '<span style="color:#ff4444;font-weight:600;">+$' + diff.toFixed(2) + ' above</span>';
-                else diffHtml = '<span style="color:#ffcc00;font-weight:600;">-$' + Math.abs(diff).toFixed(2) + ' below</span>';
-              }
-              return '<tr>' +
-                '<td style="font-weight:600;">' + esc(l.sku) + '</td>' +
-                '<td>' + esc(l.title) + '</td>' +
-                '<td style="font-weight:700;font-size:16px;">$' + l.current_price.toFixed(2) + '</td>' +
-                '<td style="font-weight:700;font-size:16px;">' + (bbPrice != null ? '<span style="color:#44aaff;">$' + bbPrice.toFixed(2) + '</span>' : '<span style="color:#666;">no BB</span>') + '</td>' +
-                '<td>' + diffHtml + '</td>' +
-                '<td>$' + l.min_price.toFixed(2) + '</td>' +
-                '<td>$' + l.max_price.toFixed(2) + '</td>' +
-                '<td>' + (l.sales_rank ? l.sales_rank.toLocaleString() : '--') + '</td>' +
-                '<td style="font-size:12px;">' + repriced + '</td>' +
-              '</tr>';
-            }).join('') +
-          '</tbody></table></div>';
-        })()}
-        ${testResults.length > 0 ? '<h3 style="font-size:12px;color:#ffcc00;text-transform:uppercase;letter-spacing:0.5px;margin:20px 0 12px;">Last Test Run — Decision Log</h3>' +
-          testResults.map(r => {
-            return '<div style="background:#111;border-radius:8px;padding:16px 20px;margin-bottom:10px;border-left:3px solid ' + (r.changed ? '#22ff55' : '#444') + ';">' +
-              '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">' +
-                '<span style="font-weight:700;color:#fff;">' + esc(r.sku) + '</span>' +
-                '<span style="font-size:14px;">' + (r.changed ? '<span class="price-down">$' + r.old_price.toFixed(2) + '</span> → <span class="price-up">$' + r.new_price.toFixed(2) + '</span>' : '<span style="color:#888;">No change — $' + r.old_price.toFixed(2) + '</span>') + '</span>' +
-              '</div>' +
-              '<div style="font-size:12px;color:#aaa;">' + esc(r.title) + '</div>' +
-              '<div style="margin-top:8px;font-size:13px;color:#ccc;">' +
-                r.decisions.map(d => {
-                  let color = '#888';
-                  if (d.startsWith('FINAL:')) color = r.changed ? '#22ff55' : '#666';
-                  else if (d.includes('BLOCKED') || d.includes('floored')) color = '#ff4444';
-                  else if (d.includes('→ raised') || d.includes('→ drop')) color = '#ffcc00';
-                  else if (d.includes('DISABLED')) color = '#555';
-                  return '<div style="padding:3px 0;color:' + color + ';">' + esc(d) + '</div>';
-                }).join('') +
-              '</div>' +
-            '</div>';
-          }).join('') : ''}
-      </div>
-
       <!-- OVERVIEW TAB -->
-      <div class="repricer-tab" id="repricer-overview">
+      <div class="repricer-tab active" id="repricer-overview">
         <div class="repricer-summary">
           <div class="stat">
             <div class="stat-val blue">${active.length}</div>
@@ -1120,34 +966,13 @@ function renderRepricer() {
             <div class="stat-lbl">At Max Price</div>
           </div>
         </div>
-        <div class="repricer-actions">
-          <button class="btn-reprice primary" onclick="handleRunRepricer()">Run Repricing Engine</button>
-          <button class="btn-reprice secondary" id="btn-sync-amazon" onclick="handleSyncFromAmazon()">Refresh Prices</button>
-          <button class="btn-reprice secondary" onclick="handleRefreshFromDb()">Refresh from DB</button>
-          <span style="font-size:12px;color:#666;align-self:center;margin-left:8px;">
-            Source: ${repricerDataSource === 'db' ? '<span style="color:#22ff55;">Supabase DB</span> (' + repricerListings.length + ' listings)' : '<span style="color:#ffaa00;">No listings in DB yet</span> — use Import SKUs below'}
-          </span>
-        </div>
-        <div class="repricer-status" id="repricer-status"></div>
-
-        <!-- Import SKUs Section -->
-        <div style="margin-top:20px;padding:20px;background:#111;border-radius:8px;border:1px solid #2a2a2a;">
-          <h3 style="font-size:13px;color:#fff;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Import SKUs</h3>
-          <p style="font-size:12px;color:#888;margin-bottom:12px;">Paste DVDBOX/WIIBOX SKUs (one per line). Each SKU will be looked up on Amazon to get ASIN, title, price, and sales rank.</p>
-          <textarea id="import-skus-input" rows="6" style="width:100%;background:#0a0a0a;border:1px solid #333;border-radius:6px;color:#e2e8f0;font-family:monospace;font-size:13px;padding:10px;resize:vertical;" placeholder="DVDBOX-1.05-01352&#10;DVDBOX-1.05-01347&#10;WIIBOX-2.00-00123"></textarea>
-          <div style="display:flex;gap:12px;margin-top:10px;align-items:center;">
-            <button class="btn-reprice primary" id="btn-import-skus" onclick="handleImportSkus()">Import SKUs</button>
-            <span id="import-sku-count" style="font-size:12px;color:#666;"></span>
-          </div>
-          <div class="repricer-status" id="import-status" style="margin-top:10px;"></div>
-        </div>
 
         <!-- Quick log preview -->
         ${repricerLog.length > 0 ? `
           <h3 style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;margin-top:20px;">Recent Changes</h3>
           <div class="table-wrap"><table>
             <thead><tr><th>Time</th><th>SKU</th><th>Old</th><th>New</th><th>Reason</th></tr></thead>
-            <tbody>${repricerLog.slice(0, 5).map(e => `
+            <tbody>${repricerLog.slice(0, 10).map(e => `
               <tr>
                 <td>${new Date(e.timestamp).toLocaleTimeString()}</td>
                 <td>${esc(e.sku)}</td>
@@ -1157,7 +982,7 @@ function renderRepricer() {
               </tr>
             `).join('')}</tbody>
           </table></div>
-        ` : '<div class="empty">No price changes yet. Run the engine to test.</div>'}
+        ` : '<div class="empty">No price changes yet. Automated repricing runs every 15 minutes.</div>'}
       </div>
 
       <!-- LISTINGS TAB -->
@@ -1264,7 +1089,7 @@ function switchRepricerTab(tab) {
   document.querySelectorAll('.repricer-nav button').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('.repricer-tab').forEach(t => t.classList.remove('active'));
   document.getElementById('repricer-' + tab).classList.add('active');
-  const tabNames = ['test', 'overview', 'listings', 'rules', 'log'];
+  const tabNames = ['overview', 'listings', 'rules', 'log'];
   const idx = tabNames.indexOf(tab);
   if (idx >= 0) {
     document.querySelectorAll('.repricer-nav button')[idx].classList.add('active');
@@ -1293,163 +1118,39 @@ async function handleAutoRepriceToggle(enabled) {
   section.outerHTML = renderRepricer();
 }
 
-async function handleImportSkus() {
-  const input = document.getElementById('import-skus-input');
-  const btn = document.getElementById('btn-import-skus');
-  const statusEl = document.getElementById('import-status');
-  if (!input) return;
-
-  const raw = input.value.trim();
-  if (!raw) { if (statusEl) { statusEl.className = 'repricer-status info'; statusEl.textContent = 'Paste SKUs first.'; } return; }
-
-  const skuFilter = /dvdbox|wiibox/i;
-  const skus = raw.split('\n').map(s => s.trim()).filter(s => s.length > 0 && skuFilter.test(s));
-
-  if (skus.length === 0) {
-    if (statusEl) { statusEl.className = 'repricer-status'; statusEl.style.display = 'block'; statusEl.style.background = '#2a0a0a'; statusEl.style.color = '#ff4444'; statusEl.style.borderColor = '#4a1a1a'; statusEl.textContent = 'No valid DVDBOX/WIIBOX SKUs found.'; }
-    return;
-  }
-
-  if (btn) { btn.disabled = true; btn.textContent = 'Importing ' + skus.length + ' SKUs...'; }
-  if (statusEl) { statusEl.className = 'repricer-status info'; statusEl.textContent = 'Starting import of ' + skus.length + ' SKUs...'; }
-
-  try {
-    const result = await callSpApi('importSkus', { skus });
-
-    if (result.error) {
-      if (statusEl) { statusEl.style.background = '#2a0a0a'; statusEl.style.color = '#ff4444'; statusEl.style.borderColor = '#4a1a1a'; statusEl.textContent = 'Import failed: ' + (result.message || JSON.stringify(result)); }
-      if (btn) { btn.disabled = false; btn.textContent = 'Import SKUs'; }
-      return;
-    }
-
-    const jobId = result.jobId;
-    if (statusEl) { statusEl.textContent = 'Import job started. Looking up SKUs on Amazon...'; }
-
-    // Poll for progress
-    const pollImport = setInterval(async () => {
-      try {
-        const s = await callSpApi('getSyncStatus', { jobId });
-        if (s.error) return;
-
-        const elapsed = Math.round((Date.now() - new Date(s.started_at).getTime()) / 1000);
-
-        if (s.status === 'running') {
-          let msg = 'Importing... (' + elapsed + 's)';
-          if (s.listings_synced > 0) msg = 'Found ' + s.listings_synced + ' listings, fetching prices... (' + elapsed + 's)';
-          else if (s.total_raw > 0) msg = 'Looking up ' + s.total_raw + ' SKUs on Amazon... (' + elapsed + 's)';
-          if (s.prices_fetched > 0) msg = 'Prices: ' + s.prices_fetched + ', ranks: ' + (s.ranks_fetched || 0) + ' (' + elapsed + 's)';
-          if (statusEl) { statusEl.className = 'repricer-status info'; statusEl.textContent = msg; }
-          return;
-        }
-
-        // Done
-        clearInterval(pollImport);
-        if (s.status === 'complete') {
-          if (statusEl) { statusEl.className = 'repricer-status success'; statusEl.textContent = 'Import complete: ' + s.listings_synced + ' listings imported, ' + (s.prices_fetched || 0) + ' prices, ' + (s.ranks_fetched || 0) + ' ranks (' + elapsed + 's)'; }
-          await initRepricerData();
-          const section = document.getElementById('repricer-section');
-          if (section) {
-            section.outerHTML = renderRepricer();
-            switchRepricerTab('overview');
-            const newStatus = document.getElementById('import-status');
-            if (newStatus) { newStatus.className = 'repricer-status success'; newStatus.textContent = 'Import complete: ' + s.listings_synced + ' listings imported (' + elapsed + 's)'; }
-          }
-        } else {
-          if (statusEl) { statusEl.style.background = '#2a0a0a'; statusEl.style.color = '#ff4444'; statusEl.style.borderColor = '#4a1a1a'; statusEl.style.display = 'block'; statusEl.textContent = 'Import failed: ' + (s.error_message || 'Unknown error'); }
-        }
-        if (btn) { btn.disabled = false; btn.textContent = 'Import SKUs'; }
-      } catch (e) {
-        console.warn('Import poll error:', e);
-      }
-    }, 3000);
-
-  } catch (e) {
-    if (statusEl) { statusEl.style.background = '#2a0a0a'; statusEl.style.color = '#ff4444'; statusEl.style.borderColor = '#4a1a1a'; statusEl.style.display = 'block'; statusEl.textContent = 'Import error: ' + e.message; }
-    if (btn) { btn.disabled = false; btn.textContent = 'Import SKUs'; }
-  }
-}
-
-async function handleRunRepricer() {
-  const btn = document.querySelector('.btn-reprice.primary');
-  if (btn) { btn.disabled = true; btn.textContent = 'Fetching Buy Box prices...'; }
-
-  // Fetch Buy Box prices for all active listings before running engine
-  const skuFilter = /dvdbox|wiibox/i;
-  const activeListings = repricerListings.filter(l => l.status === 'active' && skuFilter.test(l.sku));
-  await fetchBuyBoxForListings(activeListings);
-
-  if (btn) { btn.textContent = 'Running engine...'; }
-  const entries = runRepricerEngine();
-
-  // Persist changes to Supabase if data came from DB
-  if (repricerDataSource === 'db') {
-    for (const entry of entries) {
-      await saveLogEntry({
-        asin: entry.asin,
-        sku: entry.sku,
-        old_price: entry.old_price,
-        new_price: entry.new_price,
-        reason: entry.reason,
-      });
-      const listing = repricerListings.find(l => l.sku === entry.sku);
-      if (listing && listing.id) {
-        await updateListingInDb(listing.id, {
-          current_price: entry.new_price,
-          last_repriced: entry.timestamp,
-        });
-      }
-    }
-    // Reload log from DB
-    const freshLog = await loadRepricingLog();
-    if (Array.isArray(freshLog)) repricerLog = freshLog;
-  }
-
-  const section = document.getElementById('repricer-section');
-  section.outerHTML = renderRepricer();
-  const status = document.getElementById('repricer-status');
-  if (entries.length > 0) {
-    status.className = 'repricer-status success';
-    status.textContent = 'Engine complete: ' + entries.length + ' price change' + (entries.length !== 1 ? 's' : '') + ' applied' + (repricerDataSource === 'db' ? ' and saved to database.' : '.');
-  } else {
-    status.className = 'repricer-status info';
-    status.textContent = 'Engine complete: no price changes needed.';
-  }
-}
-
 let syncPollTimer = null;
 
-async function handleSyncFromAmazon() {
-  const btn = document.getElementById('btn-sync-amazon');
-  if (btn) { btn.disabled = true; btn.textContent = 'Starting sync...'; }
-  const status = document.getElementById('repricer-status');
-  if (status) { status.className = 'repricer-status info'; status.style.display = 'block'; status.textContent = 'Starting Amazon sync job...'; }
+async function handleTriggerDailySync() {
+  const btn = document.getElementById('btn-daily-sync');
+  if (btn) { btn.disabled = true; btn.textContent = 'Starting...'; }
+  const status = document.getElementById('sync-status');
+  if (status) { status.className = 'repricer-status info'; status.textContent = 'Starting daily listing sync...'; }
 
   try {
     const result = await callSpApi('startSync');
 
     if (result.error) {
-      if (status) { status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.textContent = 'Failed to start sync: ' + (result.message || JSON.stringify(result)); }
-      if (btn) { btn.disabled = false; btn.textContent = 'Sync from Amazon'; }
+      if (status) { status.style.display = 'block'; status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.textContent = 'Failed to start sync: ' + (result.message || JSON.stringify(result)); }
+      if (btn) { btn.disabled = false; btn.textContent = 'Sync Now'; }
       return;
     }
 
     const jobId = result.jobId;
-    if (status) { status.textContent = 'Sync job started. Waiting for Amazon report...'; }
+    if (status) { status.textContent = 'Requesting listing report from Amazon...'; }
     if (btn) { btn.textContent = 'Syncing...'; }
 
-    // Poll for status every 5 seconds
     if (syncPollTimer) clearInterval(syncPollTimer);
     syncPollTimer = setInterval(() => pollSyncStatus(jobId), 5000);
 
   } catch (e) {
-    if (status) { status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.textContent = 'Sync error: ' + e.message; }
-    if (btn) { btn.disabled = false; btn.textContent = 'Sync from Amazon'; }
+    if (status) { status.style.display = 'block'; status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.textContent = 'Sync error: ' + e.message; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Sync Now'; }
   }
 }
 
 async function pollSyncStatus(jobId) {
-  const btn = document.getElementById('btn-sync-amazon');
-  const status = document.getElementById('repricer-status');
+  const btn = document.getElementById('btn-daily-sync');
+  const status = document.getElementById('sync-status');
 
   try {
     const result = await callSpApi('getSyncStatus', { jobId });
@@ -1463,12 +1164,11 @@ async function pollSyncStatus(jobId) {
     const elapsed = Math.round((Date.now() - new Date(s.started_at).getTime()) / 1000);
 
     if (s.status === 'running') {
-      // Build progress message
       let msg = 'Syncing... (' + elapsed + 's)';
       if (s.listings_synced > 0) msg = 'Upserting listings: ' + s.listings_synced + ' done (' + elapsed + 's)';
       else if (s.ranks_fetched > 0) msg = 'Fetching sales ranks: ' + s.ranks_fetched + ' done (' + elapsed + 's)';
       else if (s.prices_fetched > 0) msg = 'Fetching live prices: ' + s.prices_fetched + ' done (' + elapsed + 's)';
-      else if (s.total_raw > 0) msg = 'Report downloaded: ' + s.total_raw + ' rows. Fetching prices... (' + elapsed + 's)';
+      else if (s.total_raw > 0) msg = 'Report downloaded: ' + s.total_raw + ' total listings. Filtering & fetching prices... (' + elapsed + 's)';
       else msg = 'Waiting for Amazon report... (' + elapsed + 's)';
 
       if (status) { status.className = 'repricer-status info'; status.style.display = 'block'; status.textContent = msg; }
@@ -1476,340 +1176,31 @@ async function pollSyncStatus(jobId) {
       return;
     }
 
-    // Done — stop polling
     clearInterval(syncPollTimer);
     syncPollTimer = null;
 
     if (s.status === 'complete') {
-      if (status) { status.className = 'repricer-status success'; status.style.display = 'block'; status.textContent = 'Sync complete: ' + s.listings_synced + ' listings synced, ' + s.prices_fetched + ' prices, ' + s.ranks_fetched + ' ranks (' + elapsed + 's)'; }
+      if (status) { status.className = 'repricer-status success'; status.style.display = 'block'; status.textContent = 'Sync complete: ' + s.listings_synced + ' listings synced, ' + (s.prices_fetched || 0) + ' prices, ' + (s.ranks_fetched || 0) + ' ranks (' + elapsed + 's)'; }
 
-      // Reload listings from DB
       await initRepricerData();
       const section = document.getElementById('repricer-section');
       if (section) {
         section.outerHTML = renderRepricer();
-        // Re-show success message on new status element
-        const newStatus = document.getElementById('repricer-status');
+        const newStatus = document.getElementById('sync-status');
         if (newStatus) {
           newStatus.className = 'repricer-status success';
           newStatus.style.display = 'block';
-          newStatus.textContent = 'Sync complete: ' + s.listings_synced + ' listings synced, ' + s.prices_fetched + ' prices, ' + s.ranks_fetched + ' ranks (' + elapsed + 's)';
+          newStatus.textContent = 'Sync complete: ' + s.listings_synced + ' listings synced, ' + (s.prices_fetched || 0) + ' prices, ' + (s.ranks_fetched || 0) + ' ranks (' + elapsed + 's)';
         }
       }
     } else if (s.status === 'failed') {
-      if (status) { status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.style.display = 'block'; status.textContent = 'Sync failed: ' + (s.error_message || 'Unknown error'); }
+      if (status) { status.style.display = 'block'; status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.textContent = 'Sync failed: ' + (s.error_message || 'Unknown error'); }
     }
 
-    if (btn) { btn.disabled = false; btn.textContent = 'Sync from Amazon'; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Sync Now'; }
 
   } catch (e) {
     console.warn('Poll error:', e);
-  }
-}
-
-async function handleRefreshFromDb() {
-  await initRepricerData();
-  const section = document.getElementById('repricer-section');
-  section.outerHTML = renderRepricer();
-  const status = document.getElementById('repricer-status');
-  if (status) {
-    status.className = 'repricer-status info';
-    status.textContent = 'Reloaded ' + repricerListings.length + ' listings from database.';
-  }
-}
-
-// ===== TEST MODE FUNCTIONS =====
-function getTestListings() {
-  return repricerListings.filter(l => TEST_SKUS.includes(l.sku));
-}
-
-async function handleFetchTestBuyBox() {
-  const testListings = getTestListings();
-  if (testListings.length === 0) return;
-  const statusEl = document.getElementById('test-status');
-  if (statusEl) { statusEl.className = 'repricer-status info'; statusEl.textContent = 'Fetching Buy Box prices...'; }
-  try {
-    for (const l of testListings) {
-      const res = await callSpApi('getCompetitivePrice', { asin: l.asin });
-      if (res.payload && res.payload[0] && res.payload[0].Product) {
-        const prices = res.payload[0].Product.CompetitivePricing.CompetitivePrices || [];
-        const buyBox = prices.find(p => p.CompetitivePriceId === '1');
-        const lowest = prices.find(p => p.CompetitivePriceId === '2');
-        testBuyBoxPrices[l.asin] = {
-          buyBox: buyBox ? buyBox.Price.LandedPrice.Amount : null,
-          lowest: lowest ? lowest.Price.LandedPrice.Amount : null,
-        };
-      }
-    }
-    const section = document.getElementById('repricer-section');
-    section.outerHTML = renderRepricer();
-    switchRepricerTab('test');
-    const newStatus = document.getElementById('test-status');
-    if (newStatus) { newStatus.className = 'repricer-status success'; newStatus.textContent = 'Buy Box prices updated.'; }
-  } catch (e) {
-    if (statusEl) { statusEl.className = 'repricer-status'; statusEl.style.display = 'block'; statusEl.style.background = '#2a0a0a'; statusEl.style.color = '#ff4444'; statusEl.style.borderColor = '#4a1a1a'; statusEl.textContent = 'Error: ' + e.message; }
-  }
-}
-
-async function handleRunTestReprice() {
-  const btn = document.getElementById('btn-test-reprice');
-  if (btn) { btn.disabled = true; btn.textContent = 'Fetching Buy Box prices...'; }
-
-  const testListings = getTestListings();
-  const now = new Date();
-  testResults = [];
-
-  // Fetch Buy Box prices for test SKUs
-  await fetchBuyBoxForListings(testListings);
-  // Copy to testBuyBoxPrices for display
-  for (const l of testListings) {
-    if (buyBoxCache[l.asin]) testBuyBoxPrices[l.asin] = buyBoxCache[l.asin];
-  }
-
-  if (btn) { btn.textContent = 'Running rules...'; }
-
-  for (const listing of testListings) {
-    const result = { sku: listing.sku, asin: listing.asin, title: listing.title, old_price: listing.current_price, new_price: listing.current_price, decisions: [], changed: false };
-    const bbData = buyBoxCache[listing.asin];
-    const bbPrice = bbData ? bbData.buyBox : null;
-    result.buyBox = bbPrice;
-
-    let newPrice = listing.current_price;
-
-    // Pre-pass: Max Hit Day 1 (adjust max)
-    const r2 = REPRICER_RULES.find(r => r.rule_name === 'Max Hit Day 1');
-    if (r2 && r2.is_active) {
-      const dateListed = new Date(listing.date_listed + 'T00:00:00');
-      const daysSinceListed = Math.floor((now - dateListed) / 86400000);
-      const raiseAmount = parseFloat(r2.max_hit_raise_amount) || 3.00;
-      if (daysSinceListed <= 1 && listing.current_price >= listing.max_price) {
-        listing.max_price = parseFloat((listing.max_price + raiseAmount).toFixed(2));
-        result.decisions.push('Max Hit Day 1: listed ' + daysSinceListed + 'd ago at max → raised max to $' + listing.max_price.toFixed(2));
-      } else {
-        result.decisions.push('Max Hit Day 1: listed ' + daysSinceListed + 'd ago, price $' + listing.current_price.toFixed(2) + ' vs max $' + listing.max_price.toFixed(2) + ' → no trigger');
-      }
-    } else {
-      result.decisions.push('Max Hit Day 1: DISABLED, skipped');
-    }
-
-    // Pre-pass: Stale Inventory (adjust min)
-    const r3 = REPRICER_RULES.find(r => r.rule_name === 'Stale Inventory');
-    if (r3 && r3.is_active) {
-      const daysBefore = parseInt(r3.days_before_drop) || 30;
-      const dropAmount = parseFloat(r3.drop_amount) || 0.50;
-      const dateListed = new Date(listing.date_listed + 'T00:00:00');
-      const daysActive = Math.floor((now - dateListed) / 86400000);
-      const lastSold = listing.last_sold ? new Date(listing.last_sold) : null;
-      const daysSinceSale = lastSold ? Math.floor((now - lastSold) / 86400000) : daysActive;
-      if (daysSinceSale >= daysBefore) {
-        const oldMin = listing.min_price;
-        listing.min_price = parseFloat((listing.min_price - dropAmount).toFixed(2));
-        result.decisions.push('Stale Inventory: ' + daysSinceSale + 'd without sale (threshold ' + daysBefore + 'd) → lowered min from $' + oldMin.toFixed(2) + ' to $' + listing.min_price.toFixed(2));
-      } else {
-        result.decisions.push('Stale Inventory: ' + daysSinceSale + 'd without sale (threshold ' + daysBefore + 'd) → not stale yet');
-      }
-    } else {
-      result.decisions.push('Stale Inventory: DISABLED, skipped');
-    }
-
-    // Rule 0: Match Buy Box
-    const bbRule = REPRICER_RULES.find(r => r.rule_name === 'Match Buy Box');
-    if (bbRule && bbRule.is_active) {
-      const nobbRaise = parseFloat(bbRule.no_buybox_raise_amount) || 1.00;
-      if (bbPrice != null) {
-        if (bbPrice >= listing.min_price && bbPrice <= listing.max_price) {
-          newPrice = bbPrice;
-          result.decisions.push('Match Buy Box: BB $' + bbPrice.toFixed(2) + ' within min $' + listing.min_price.toFixed(2) + '–max $' + listing.max_price.toFixed(2) + ' → matched at $' + bbPrice.toFixed(2));
-        } else if (bbPrice < listing.min_price) {
-          newPrice = listing.min_price;
-          result.decisions.push('Match Buy Box: BB $' + bbPrice.toFixed(2) + ' below min $' + listing.min_price.toFixed(2) + ' → set to min');
-        } else {
-          newPrice = listing.max_price;
-          result.decisions.push('Match Buy Box: BB $' + bbPrice.toFixed(2) + ' above max $' + listing.max_price.toFixed(2) + ' → set to max');
-        }
-      } else {
-        const raised = Math.min(listing.current_price + nobbRaise, listing.max_price);
-        newPrice = parseFloat(raised.toFixed(2));
-        result.decisions.push('Match Buy Box: No Buy Box found → incremental raise of $' + nobbRaise.toFixed(2) + ' to $' + newPrice.toFixed(2));
-      }
-    } else {
-      result.decisions.push('Match Buy Box: DISABLED, skipped');
-    }
-
-    // Rule 1: Default Floors
-    const r1 = REPRICER_RULES.find(r => r.rule_name === 'Default Floors');
-    if (r1 && r1.is_active) {
-      if (newPrice < listing.min_price) {
-        result.decisions.push('Default Floors: $' + newPrice.toFixed(2) + ' below min $' + listing.min_price.toFixed(2) + ' → raised to min');
-        newPrice = listing.min_price;
-      } else if (newPrice > listing.max_price) {
-        result.decisions.push('Default Floors: $' + newPrice.toFixed(2) + ' above max $' + listing.max_price.toFixed(2) + ' → lowered to max');
-        newPrice = listing.max_price;
-      } else {
-        result.decisions.push('Default Floors: $' + newPrice.toFixed(2) + ' within range $' + listing.min_price.toFixed(2) + '–$' + listing.max_price.toFixed(2) + ' → OK');
-      }
-    } else {
-      result.decisions.push('Default Floors: DISABLED, skipped');
-    }
-
-    // Rule 4: Never Below Cost
-    const r4 = REPRICER_RULES.find(r => r.rule_name === 'Never Below Cost');
-    if (r4 && r4.is_active) {
-      if (newPrice < listing.cost_basis) {
-        result.decisions.push('Never Below Cost: $' + newPrice.toFixed(2) + ' below cost $' + listing.cost_basis.toFixed(2) + ' → floored at cost');
-        newPrice = listing.cost_basis;
-      } else {
-        result.decisions.push('Never Below Cost: $' + newPrice.toFixed(2) + ' above cost $' + listing.cost_basis.toFixed(2) + ' → OK');
-      }
-    } else {
-      result.decisions.push('Never Below Cost: DISABLED, skipped');
-    }
-
-    // Rule 5: Sales Rank Guard
-    const r5 = REPRICER_RULES.find(r => r.rule_name === 'Sales Rank Guard');
-    if (r5 && r5.is_active) {
-      const threshold = parseInt(r5.target_position) || 500000;
-      if (listing.sales_rank > threshold && newPrice < listing.current_price) {
-        result.decisions.push('Sales Rank Guard: rank ' + (listing.sales_rank || 0).toLocaleString() + ' > ' + threshold.toLocaleString() + ' and price dropping → BLOCKED');
-        newPrice = listing.current_price;
-      } else {
-        result.decisions.push('Sales Rank Guard: rank ' + (listing.sales_rank || 0).toLocaleString() + ' vs threshold ' + threshold.toLocaleString() + ' → OK');
-      }
-    } else {
-      result.decisions.push('Sales Rank Guard: DISABLED, skipped');
-    }
-
-    // Final bounds
-    newPrice = Math.max(newPrice, listing.min_price);
-    newPrice = Math.min(newPrice, listing.max_price);
-    newPrice = parseFloat(newPrice.toFixed(2));
-
-    result.new_price = newPrice;
-    result.changed = newPrice !== listing.current_price;
-
-    if (result.changed) {
-      result.decisions.push('FINAL: price changed $' + listing.current_price.toFixed(2) + ' → $' + newPrice.toFixed(2));
-      const logEntry = {
-        asin: listing.asin,
-        sku: listing.sku,
-        old_price: listing.current_price,
-        new_price: newPrice,
-        reason: 'TEST: ' + result.decisions.filter(d => !d.includes('no change') && !d.includes('no trigger') && !d.includes('not stale') && !d.includes('→ OK') && !d.includes('skipped')).join('; '),
-      };
-      await saveLogEntry(logEntry);
-      if (listing.id) {
-        await updateListingInDb(listing.id, { current_price: newPrice, last_repriced: now.toISOString() });
-      }
-      listing.current_price = newPrice;
-      listing.last_repriced = now.toISOString();
-    } else {
-      result.decisions.push('FINAL: no price change needed');
-    }
-
-    testResults.push(result);
-  }
-
-  // Reload log
-  const freshLog = await loadRepricingLog();
-  if (Array.isArray(freshLog)) repricerLog = freshLog;
-
-  const section = document.getElementById('repricer-section');
-  section.outerHTML = renderRepricer();
-  switchRepricerTab('test');
-  const newStatus = document.getElementById('test-status');
-  if (newStatus) {
-    const changed = testResults.filter(r => r.changed).length;
-    newStatus.className = changed > 0 ? 'repricer-status success' : 'repricer-status info';
-    newStatus.textContent = 'Test reprice complete: ' + changed + ' of ' + testResults.length + ' listings changed.';
-  }
-}
-
-async function handlePushToAmazon() {
-  const changed = testResults.filter(r => r.changed);
-  if (changed.length === 0) return;
-
-  const btn = document.getElementById('btn-push-amazon');
-  if (btn) { btn.disabled = true; btn.textContent = 'Pushing to Amazon...'; }
-  const statusEl = document.getElementById('test-status');
-
-  const pushResults = [];
-
-  for (const r of changed) {
-    try {
-      if (statusEl) { statusEl.className = 'repricer-status info'; statusEl.textContent = 'Updating ' + r.sku + ' to $' + r.new_price.toFixed(2) + '...'; }
-      const res = await callSpApi('updatePrice', { sku: r.sku, price: r.new_price });
-      const hasError = res.error || (res.status && res.status === 'INVALID');
-      pushResults.push({ sku: r.sku, price: r.new_price, success: !hasError, detail: hasError ? JSON.stringify(res) : 'OK' });
-    } catch (e) {
-      pushResults.push({ sku: r.sku, price: r.new_price, success: false, detail: e.message });
-    }
-  }
-
-  // Re-render and show results
-  const section = document.getElementById('repricer-section');
-  section.outerHTML = renderRepricer();
-  switchRepricerTab('test');
-
-  const newStatus = document.getElementById('test-status');
-  if (newStatus) {
-    const ok = pushResults.filter(p => p.success).length;
-    const fail = pushResults.filter(p => !p.success).length;
-    newStatus.className = fail > 0 ? 'repricer-status' : 'repricer-status success';
-    if (fail > 0) { newStatus.style.display = 'block'; newStatus.style.background = '#2a1a0a'; newStatus.style.color = '#ffaa00'; newStatus.style.borderColor = '#4a3a1a'; }
-    newStatus.innerHTML = '<div style="margin-bottom:8px;font-weight:700;">Amazon Push Results: ' + ok + ' sent' + (fail > 0 ? ', ' + fail + ' failed' : '') + '</div>' +
-      pushResults.map(p =>
-        '<div style="padding:4px 0;display:flex;gap:12px;align-items:center;">' +
-          '<span style="font-weight:600;width:180px;">' + esc(p.sku) + '</span>' +
-          '<span style="width:80px;">$' + p.price.toFixed(2) + '</span>' +
-          (p.success
-            ? '<span style="color:#22ff55;font-weight:600;">Sent</span>'
-            : '<span style="color:#ff4444;">Failed: ' + esc(p.detail) + '</span>') +
-        '</div>'
-      ).join('');
-  }
-}
-
-async function handleForceTestPush() {
-  const tl = getTestListings();
-  if (tl.length === 0) { alert('No test SKUs in database.'); return; }
-
-  const btn = document.getElementById('btn-force-push');
-  if (btn) { btn.disabled = true; btn.textContent = 'Pushing...'; }
-  const statusEl = document.getElementById('test-status');
-
-  const pushResults = [];
-
-  for (const l of tl) {
-    if (statusEl) { statusEl.className = 'repricer-status info'; statusEl.textContent = 'Sending ' + l.sku + ' at $' + l.current_price.toFixed(2) + '...'; }
-    try {
-      const res = await callSpApi('updatePrice', { sku: l.sku, price: l.current_price });
-      const raw = JSON.stringify(res);
-      const hasError = res.error || (res.status && res.status === 'INVALID');
-      pushResults.push({ sku: l.sku, price: l.current_price, success: !hasError, detail: raw });
-    } catch (e) {
-      pushResults.push({ sku: l.sku, price: l.current_price, success: false, detail: e.message });
-    }
-  }
-
-  if (btn) { btn.disabled = false; btn.textContent = 'Force Test Push'; }
-  if (statusEl) {
-    const ok = pushResults.filter(p => p.success).length;
-    const fail = pushResults.filter(p => !p.success).length;
-    statusEl.className = fail > 0 ? 'repricer-status' : 'repricer-status success';
-    if (fail > 0) { statusEl.style.display = 'block'; statusEl.style.background = '#2a0a0a'; statusEl.style.color = '#ff4444'; statusEl.style.borderColor = '#4a1a1a'; }
-    statusEl.innerHTML = '<div style="margin-bottom:8px;font-weight:700;">Force Test Push Results: ' + ok + ' sent, ' + fail + ' failed</div>' +
-      pushResults.map(p =>
-        '<div style="padding:6px 0;border-bottom:1px solid #222;">' +
-          '<div style="display:flex;gap:12px;align-items:center;">' +
-            '<span style="font-weight:600;width:180px;">' + esc(p.sku) + '</span>' +
-            '<span style="width:80px;">$' + p.price.toFixed(2) + '</span>' +
-            (p.success
-              ? '<span style="color:#22ff55;font-weight:600;">Sent</span>'
-              : '<span style="color:#ff4444;font-weight:600;">Failed</span>') +
-          '</div>' +
-          '<div style="font-size:11px;color:#888;margin-top:4px;word-break:break-all;">' + esc(p.detail) + '</div>' +
-        '</div>'
-      ).join('');
   }
 }
 
