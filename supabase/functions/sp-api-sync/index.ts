@@ -447,7 +447,7 @@ async function runSync(jobId: string) {
       .from("listings")
       .select("id, sku")
       .eq("status", "active")
-      .or("sku.ilike.%dvdbox%,sku.ilike.%wiibox%");
+      .or("sku.ilike.*dvdbox*,sku.ilike.*wiibox*");
 
     let deactivated = 0;
     if (dbListings) {

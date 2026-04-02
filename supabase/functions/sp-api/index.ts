@@ -135,7 +135,7 @@ async function handleFetchListings(): Promise<unknown> {
     .from("listings")
     .select("*")
     .eq("status", "active")
-    .or("sku.ilike.%dvdbox%,sku.ilike.%wiibox%")
+    .or("sku.ilike.*dvdbox*,sku.ilike.*wiibox*")
     .order("sku", { ascending: true })
     .range(0, 4999);
 

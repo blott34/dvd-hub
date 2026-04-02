@@ -292,7 +292,7 @@ async function runAutoReprice() {
       .from("listings")
       .select("*", { count: "exact" })
       .eq("status", "active")
-      .or("sku.ilike.%dvdbox%,sku.ilike.%wiibox%")
+      .or("sku.ilike.*dvdbox*,sku.ilike.*wiibox*")
       .range(0, 4999);
 
     console.log("Listings query result — count:", listCount, "rows returned:", listings?.length, "error:", listErr?.message || "none");
