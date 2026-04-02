@@ -793,6 +793,7 @@ let repricerListings = [];
 let repricerLog = [];
 let repricerDataSource = 'db';
 let autoRepriceEnabled = true;
+let liveMode = false;
 let lastRepriceRun = null;
 let lastDailySync = null;
 
@@ -839,6 +840,7 @@ async function initRepricerData() {
 
     if (Array.isArray(arSettings) && arSettings.length > 0) {
       autoRepriceEnabled = arSettings[0].enabled;
+      liveMode = arSettings[0].live_mode === true;
     }
 
     if (Array.isArray(arRun) && arRun.length > 0) {
@@ -877,6 +879,11 @@ function renderRepricer() {
     <section class="section" id="repricer-section">
       <h2>Repricer</h2>
 
+      <!-- Simulation / Live Mode Banner -->
+      <div style="padding:12px 20px;border-radius:8px;margin-bottom:16px;font-size:14px;font-weight:700;text-align:center;letter-spacing:0.5px;${liveMode ? 'background:#0a2a0a;color:#22ff55;border:2px solid #1a4a1a;' : 'background:#2a1a00;color:#ffcc00;border:2px solid #4a3a00;'}">
+        ${liveMode ? 'LIVE MODE — Price changes are being pushed to Amazon' : 'SIMULATION MODE — Observing only, no prices pushed to Amazon'}
+      </div>
+
       <!-- Auto-Reprice Bar -->
       <div class="auto-reprice-bar">
         <div class="toggle-label">
@@ -886,6 +893,13 @@ function renderRepricer() {
           </label>
           <span>Auto Reprice</span>
           <span style="font-weight:400;font-size:12px;color:${autoRepriceEnabled ? '#22ff55' : '#ff4444'};">${autoRepriceEnabled ? 'ACTIVE — every 15 min' : 'PAUSED'}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;margin-left:24px;">
+          <label class="toggle-switch">
+            <input type="checkbox" ${liveMode ? 'checked' : ''} onchange="handleLiveModeToggle(this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+          <span style="font-weight:600;font-size:13px;color:${liveMode ? '#22ff55' : '#ffcc00'};">${liveMode ? 'Live' : 'Sim'}</span>
         </div>
         <div class="auto-reprice-stats">
           ${lastRepriceRun ? `
@@ -1122,6 +1136,26 @@ function updateRuleField(index, field, value) {
 async function handleAutoRepriceToggle(enabled) {
   autoRepriceEnabled = enabled;
   await setAutoRepriceEnabled(enabled);
+  const section = document.getElementById('repricer-section');
+  section.outerHTML = renderRepricer();
+}
+
+async function handleLiveModeToggle(enabled) {
+  if (enabled && !confirm('Enable LIVE MODE? The repricer will push real price changes to Amazon.')) {
+    const section = document.getElementById('repricer-section');
+    section.outerHTML = renderRepricer();
+    return;
+  }
+  liveMode = enabled;
+  await fetch(`${SUPABASE_URL}/rest/v1/auto_reprice_settings?id=eq.1`, {
+    method: 'PATCH',
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ live_mode: enabled, updated_at: new Date().toISOString() }),
+  });
   const section = document.getElementById('repricer-section');
   section.outerHTML = renderRepricer();
 }

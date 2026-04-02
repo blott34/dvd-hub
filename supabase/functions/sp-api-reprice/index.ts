@@ -329,10 +329,10 @@ async function runAutoReprice() {
   const sb = getSupabaseAdmin();
   const marketplaceId = Deno.env.get("SP_API_MARKETPLACE_ID") || "ATVPDKIKX0DER";
 
-  // Step 0: Check if auto-reprice is enabled
+  // Step 0: Check if auto-reprice is enabled and whether live_mode is on
   const { data: settings, error: settingsErr } = await sb
     .from("auto_reprice_settings")
-    .select("enabled")
+    .select("enabled,live_mode")
     .eq("id", 1)
     .single();
 
@@ -342,6 +342,9 @@ async function runAutoReprice() {
     console.log("Auto-reprice is disabled. Skipping.");
     return { skipped: true, reason: "Auto-reprice disabled" };
   }
+
+  const liveMode = settings.live_mode === true;
+  console.log("Mode:", liveMode ? "LIVE — will push to Amazon" : "SIMULATION — observe only");
 
   // Load repricing rules (small table, load once)
   const { data: rules } = await sb
@@ -454,82 +457,90 @@ async function runAutoReprice() {
     totalChanged = changes.length;
     console.log("Engine:", changes.length, "changes");
 
-    // Push price changes to Amazon (capped at MAX_PUSHES per invocation)
-    const toPush = changes.slice(0, MAX_PUSHES);
-    for (const change of toPush) {
-      try {
-        const encodedSku = encodeURIComponent(change.sku);
+    // Push price changes to Amazon — ONLY in live mode
+    if (liveMode) {
+      const toPush = changes.slice(0, MAX_PUSHES);
+      for (const change of toPush) {
+        try {
+          const encodedSku = encodeURIComponent(change.sku);
 
-        const listingInfo = await spApiRequest(
-          `/listings/2021-08-01/items/${CONFIRMED_SELLER_ID}/${encodedSku}?marketplaceIds=${marketplaceId}&includedData=summaries`
-        ) as Record<string, unknown>;
+          const listingInfo = await spApiRequest(
+            `/listings/2021-08-01/items/${CONFIRMED_SELLER_ID}/${encodedSku}?marketplaceIds=${marketplaceId}&includedData=summaries`
+          ) as Record<string, unknown>;
 
-        let productType: string | null = null;
-        if (listingInfo && !listingInfo.error) {
-          const summaries = listingInfo.summaries as Array<Record<string, unknown>> | undefined;
-          if (summaries && summaries.length > 0 && summaries[0].productType) {
-            productType = summaries[0].productType as string;
+          let productType: string | null = null;
+          if (listingInfo && !listingInfo.error) {
+            const summaries = listingInfo.summaries as Array<Record<string, unknown>> | undefined;
+            if (summaries && summaries.length > 0 && summaries[0].productType) {
+              productType = summaries[0].productType as string;
+            }
           }
-        }
 
-        if (!productType) {
-          allErrors.push(`${change.sku}: no productType`);
-          continue;
-        }
+          if (!productType) {
+            allErrors.push(`${change.sku}: no productType`);
+            continue;
+          }
 
-        const patchBody = {
-          productType,
-          patches: [{
-            op: "replace",
-            path: "/attributes/purchasable_offer",
-            value: [{
-              marketplace_id: marketplaceId,
-              currency: "USD",
-              our_price: [{ schedule: [{ value_with_tax: change.new_price.toFixed(2) }] }],
+          const patchBody = {
+            productType,
+            patches: [{
+              op: "replace",
+              path: "/attributes/purchasable_offer",
+              value: [{
+                marketplace_id: marketplaceId,
+                currency: "USD",
+                our_price: [{ schedule: [{ value_with_tax: change.new_price.toFixed(2) }] }],
+              }],
             }],
-          }],
-        };
+          };
 
-        const patchResult = await spApiRequest(
-          `/listings/2021-08-01/items/${CONFIRMED_SELLER_ID}/${encodedSku}?marketplaceIds=${marketplaceId}&issueLocale=en_US`,
-          "PATCH",
-          patchBody
-        ) as Record<string, unknown>;
+          const patchResult = await spApiRequest(
+            `/listings/2021-08-01/items/${CONFIRMED_SELLER_ID}/${encodedSku}?marketplaceIds=${marketplaceId}&issueLocale=en_US`,
+            "PATCH",
+            patchBody
+          ) as Record<string, unknown>;
 
-        if (patchResult.error) {
-          allErrors.push(`${change.sku}: PATCH failed`);
-        } else {
-          totalPushed++;
-          console.log(`  ${change.sku}: $${change.old_price.toFixed(2)} -> $${change.new_price.toFixed(2)}`);
+          if (patchResult.error) {
+            allErrors.push(`${change.sku}: PATCH failed`);
+          } else {
+            totalPushed++;
+            console.log(`  ${change.sku}: $${change.old_price.toFixed(2)} -> $${change.new_price.toFixed(2)}`);
+          }
+        } catch (err) {
+          allErrors.push(`${change.sku}: ${err instanceof Error ? err.message : String(err)}`);
         }
-      } catch (err) {
-        allErrors.push(`${change.sku}: ${err instanceof Error ? err.message : String(err)}`);
+        await sleep(200);
       }
-      await sleep(200);
+
+      if (changes.length > MAX_PUSHES) {
+        console.log("Capped Amazon pushes at", MAX_PUSHES, "of", changes.length, "— rest will be pushed next cycle");
+      }
+    } else {
+      console.log("SIMULATION MODE: skipping Amazon push for", changes.length, "changes");
     }
 
-    if (changes.length > MAX_PUSHES) {
-      console.log("Capped Amazon pushes at", MAX_PUSHES, "of", changes.length, "— rest will be pushed next cycle");
-    }
-
-    // Persist ALL changes to Supabase (even if not all were pushed to Amazon yet)
+    // Log all changes to repricing_log
     if (changes.length > 0) {
+      const tag = liveMode ? "[AUTO]" : "[SIM]";
       const logRows = changes.map((c) => ({
         asin: c.asin,
         sku: c.sku,
         old_price: c.old_price,
         new_price: c.new_price,
-        reason: "[AUTO] " + c.reason,
+        reason: tag + " " + c.reason,
       }));
       await sb.from("repricing_log").insert(logRows);
 
-      for (const change of changes) {
-        const listing = listings.find((l) => l.sku === change.sku);
-        if (listing) {
-          await sb.from("listings").update({
-            current_price: change.new_price,
-            last_repriced: new Date().toISOString(),
-          }).eq("id", listing.id);
+      // Only update listing prices in DB when in live mode
+      if (liveMode) {
+        for (const change of changes) {
+          const listing = listings.find((l) => l.sku === change.sku);
+          if (listing) {
+            await sb.from("listings").update({
+              current_price: change.new_price,
+              last_repriced: new Date().toISOString(),
+            }).eq("id", listing.id);
+          }
         }
       }
     }
