@@ -158,6 +158,14 @@ function runRepricingEngine(
       if (daysSinceListed <= 1 && listing.current_price >= listing.max_price) {
         listing.max_price = parseFloat((listing.max_price + raiseAmount).toFixed(2));
       }
+      // Also: if day 1 and Buy Box is above max, raise max to match Buy Box
+      if (daysSinceListed <= 1) {
+        const bbData = buyBoxPrices[listing.asin];
+        const bbPrice = bbData ? bbData.buyBox : null;
+        if (bbPrice != null && bbPrice > listing.max_price) {
+          listing.max_price = parseFloat(bbPrice.toFixed(2));
+        }
+      }
     }
 
     // Pre-pass: Stale Inventory
@@ -237,6 +245,9 @@ function runRepricingEngine(
     newPrice = Math.max(newPrice, listing.min_price);
     newPrice = Math.min(newPrice, listing.max_price);
     newPrice = parseFloat(newPrice.toFixed(2));
+
+    // Hard cap: never exceed max_price regardless of earlier rule mutations
+    if (newPrice > listing.max_price) newPrice = listing.max_price;
 
     if (newPrice !== listing.current_price) {
       log.push({
