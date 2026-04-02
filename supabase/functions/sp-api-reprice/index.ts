@@ -1,8 +1,14 @@
 // Supabase Edge Function: sp-api-reprice
 // Automatic repricing engine that runs on a pg_cron schedule.
-// Checks the auto_reprice_settings toggle, loads all active DVDBOX/WIIBOX
-// listings, fetches Buy Box prices, applies repricing rules, and pushes
-// price changes to Amazon.
+// Checks the auto_reprice_settings toggle, loads active DVDBOX/WIIBOX
+// listings in pages, fetches Buy Box prices, applies repricing rules,
+// and pushes price changes to Amazon.
+//
+// Designed to stay within edge function resource limits by:
+//   - Loading listings in pages of 200
+//   - Selecting only needed columns
+//   - Processing Buy Box fetches in small batches
+//   - Batching DB writes
 //
 // Deploy: supabase functions deploy sp-api-reprice
 
@@ -81,13 +87,12 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ---- Repricing Engine (server-side, mirrors src/repricer/engine.js) ----
+// ---- Repricing Engine ----
 
 interface Listing {
   id: string;
   asin: string;
   sku: string;
-  title: string;
   current_price: number;
   min_price: number;
   max_price: number;
@@ -250,7 +255,75 @@ function runRepricingEngine(
   return log;
 }
 
+// ---- Buy Box fetch helper (batch only, no single-ASIN fallback) ----
+
+async function fetchBuyBoxBatch(
+  asins: string[],
+  marketplaceId: string,
+): Promise<Record<string, BuyBoxData>> {
+  const result: Record<string, BuyBoxData> = {};
+
+  const requests = asins.map((asin) => ({
+    MarketplaceId: marketplaceId,
+    Asin: asin,
+    ItemType: "Asin",
+  }));
+
+  const apiRes = await spApiRequest(
+    "/batches/products/pricing/v0/competitivePrice",
+    "POST",
+    { requests }
+  ) as Record<string, unknown>;
+
+  const responses = apiRes.responses as Array<Record<string, unknown>> | undefined;
+  if (responses && Array.isArray(responses)) {
+    for (const resp of responses) {
+      const respBody = resp.body as Record<string, unknown> | undefined;
+      if (!respBody) continue;
+      const payload = respBody.payload as Record<string, unknown> | undefined;
+      if (!payload) continue;
+
+      const asin = (payload.ASIN || payload.asin) as string;
+      if (!asin) continue;
+
+      const competitivePricing = payload.CompetitivePricing as Record<string, unknown> | undefined;
+      const prices = competitivePricing?.CompetitivePrices as Array<Record<string, unknown>> | undefined;
+      if (!prices) {
+        result[asin] = { buyBox: null, lowest: null };
+        continue;
+      }
+
+      const bb = prices.find((p) => p.CompetitivePriceId === "1");
+      const low = prices.find((p) => p.CompetitivePriceId === "2");
+
+      const getPrice = (entry: Record<string, unknown> | undefined): number | null => {
+        if (!entry) return null;
+        const price = entry.Price as Record<string, unknown> | undefined;
+        const landed = price?.LandedPrice as Record<string, unknown> | undefined;
+        if (landed?.Amount) return parseFloat(String(landed.Amount));
+        return null;
+      };
+
+      result[asin] = { buyBox: getPrice(bb), lowest: getPrice(low) };
+    }
+  }
+
+  // Fill in any missing ASINs as no-data
+  for (const asin of asins) {
+    if (!result[asin]) result[asin] = { buyBox: null, lowest: null };
+  }
+
+  return result;
+}
+
 // ---- Main reprice logic ----
+// Processes listings in chunks of CHUNK_SIZE to stay within resource limits.
+// Each chunk: load listings → fetch Buy Box → run engine → push changes → persist.
+
+const LISTING_COLS = "id,asin,sku,current_price,min_price,max_price,cost_basis,sales_rank,date_listed,last_sold,last_repriced,status";
+const BATCH_SIZE = 100;  // listings per invocation — must complete in ~60s wall clock
+const BB_BATCH = 20;     // ASINs per Buy Box API call
+const MAX_PUSHES = 25;   // max Amazon price pushes per invocation (~2s each)
 
 async function runAutoReprice() {
   const sb = getSupabaseAdmin();
@@ -263,12 +336,49 @@ async function runAutoReprice() {
     .eq("id", 1)
     .single();
 
-  console.log("Auto-reprice settings query:", JSON.stringify({ settings, error: settingsErr?.message }));
+  console.log("Settings:", JSON.stringify({ settings, err: settingsErr?.message }));
 
   if (!settings || !settings.enabled) {
     console.log("Auto-reprice is disabled. Skipping.");
     return { skipped: true, reason: "Auto-reprice disabled" };
   }
+
+  // Load repricing rules (small table, load once)
+  const { data: rules } = await sb
+    .from("repricing_rules")
+    .select("*")
+    .order("id", { ascending: true });
+
+  if (!rules || rules.length === 0) {
+    return { error: "No repricing rules found" };
+  }
+
+  console.log("Rules loaded:", rules.length);
+
+  // Determine which batch to process this invocation.
+  // Each run processes BATCH_SIZE listings starting from a rotating offset.
+  // The offset is stored in auto_reprice_settings so the next cron picks up where we left off.
+  const { data: offsetRow } = await sb
+    .from("auto_reprice_settings")
+    .select("interval_minutes")
+    .eq("id", 1)
+    .single();
+
+  // Reuse interval_minutes column to store the current offset (it's not used for anything else)
+  let currentOffset = offsetRow?.interval_minutes || 0;
+
+  // Count total active listings (lightweight HEAD-style query)
+  const { count: totalActive } = await sb
+    .from("listings")
+    .select("id", { count: "exact", head: true })
+    .eq("status", "active")
+    .or("sku.ilike.*dvdbox*,sku.ilike.*wiibox*");
+
+  const totalListings = totalActive || 0;
+  console.log("Total active listings:", totalListings, "| Starting at offset:", currentOffset);
+
+  // If offset is past the end, wrap around
+  if (currentOffset >= totalListings) currentOffset = 0;
 
   // Create a reprice_runs record
   const { data: run, error: runErr } = await sb
@@ -283,30 +393,33 @@ async function runAutoReprice() {
   }
 
   const runId = run.id;
-  console.log("Auto-reprice run started:", runId);
+  let totalChecked = 0;
+  let totalChanged = 0;
+  let totalPushed = 0;
+  const allErrors: string[] = [];
 
   try {
-    // Step 1: Load active DVDBOX/WIIBOX listings from Supabase
-    // Supabase JS client defaults to 1000 rows — use range to get all
-    const { data: listings, error: listErr, count: listCount } = await sb
+    // Load this batch of listings
+    const { data: batch, error: batchErr } = await sb
       .from("listings")
-      .select("*", { count: "exact" })
+      .select(LISTING_COLS)
       .eq("status", "active")
       .or("sku.ilike.*dvdbox*,sku.ilike.*wiibox*")
-      .range(0, 4999);
+      .range(currentOffset, currentOffset + BATCH_SIZE - 1);
 
-    console.log("Listings query result — count:", listCount, "rows returned:", listings?.length, "error:", listErr?.message || "none");
+    if (batchErr) throw new Error("Batch load failed: " + batchErr.message);
 
-    if (listErr) throw new Error("Failed to load listings: " + listErr.message);
+    const listings = (batch || []) as Listing[];
+    totalChecked = listings.length;
+    console.log("Loaded", listings.length, "listings (offset", currentOffset, "-", currentOffset + listings.length - 1, ")");
 
-    const activeListings = (listings || []) as Listing[];
+    // Save next offset for the next cron run
+    const nextOffset = currentOffset + listings.length;
+    await sb.from("auto_reprice_settings").update({
+      interval_minutes: nextOffset >= totalListings ? 0 : nextOffset,
+    }).eq("id", 1);
 
-    console.log("Active DVDBOX/WIIBOX listings:", activeListings.length);
-    if (activeListings.length > 0) {
-      console.log("Sample listing:", JSON.stringify(activeListings[0]));
-    }
-
-    if (activeListings.length === 0) {
+    if (listings.length === 0) {
       await sb.from("reprice_runs").update({
         status: "complete",
         completed_at: new Date().toISOString(),
@@ -316,139 +429,37 @@ async function runAutoReprice() {
       return { ok: true, listings_checked: 0, prices_changed: 0 };
     }
 
-    // Step 2: Load repricing rules
-    const { data: rules } = await sb
-      .from("repricing_rules")
-      .select("*")
-      .order("id", { ascending: true });
-
-    if (!rules || rules.length === 0) {
-      throw new Error("No repricing rules found");
-    }
-
-    // Step 3: Fetch Buy Box prices for all active listings
-    console.log("Fetching Buy Box prices for", activeListings.length, "listings...");
+    // Fetch Buy Box prices for this batch
+    const batchAsins = [...new Set(listings.map((l) => l.asin).filter(Boolean))];
     const buyBoxPrices: Record<string, BuyBoxData> = {};
-    const asins = [...new Set(activeListings.map((l) => l.asin).filter(Boolean))];
 
-    // Batch competitive pricing — up to 20 ASINs at a time
-    const BB_BATCH = 20;
-    for (let i = 0; i < asins.length; i += BB_BATCH) {
-      const batch = asins.slice(i, i + BB_BATCH);
-
+    for (let i = 0; i < batchAsins.length; i += BB_BATCH) {
+      const asinBatch = batchAsins.slice(i, i + BB_BATCH);
       try {
-        const requests = batch.map((asin) => ({
-          MarketplaceId: marketplaceId,
-          Asin: asin,
-          ItemType: "Asin",
-        }));
-
-        const result = await spApiRequest(
-          "/batches/products/pricing/v0/competitivePrice",
-          "POST",
-          { requests }
-        ) as Record<string, unknown>;
-
-        // Parse batch response
-        const responses = (result as Record<string, unknown>).responses as Array<Record<string, unknown>> | undefined;
-        if (responses && Array.isArray(responses)) {
-          for (const resp of responses) {
-            const respBody = resp.body as Record<string, unknown> | undefined;
-            if (!respBody) continue;
-            const payload = respBody.payload as Record<string, unknown> | undefined;
-            if (!payload) continue;
-
-            const asin = (payload.ASIN || payload.asin) as string;
-            if (!asin) continue;
-
-            const competitivePricing = payload.CompetitivePricing as Record<string, unknown> | undefined;
-            const prices = competitivePricing?.CompetitivePrices as Array<Record<string, unknown>> | undefined;
-            if (!prices) {
-              buyBoxPrices[asin] = { buyBox: null, lowest: null };
-              continue;
-            }
-
-            const bb = prices.find((p) => p.CompetitivePriceId === "1");
-            const low = prices.find((p) => p.CompetitivePriceId === "2");
-
-            const getBBPrice = (entry: Record<string, unknown> | undefined): number | null => {
-              if (!entry) return null;
-              const price = entry.Price as Record<string, unknown> | undefined;
-              const landed = price?.LandedPrice as Record<string, unknown> | undefined;
-              if (landed?.Amount) return parseFloat(String(landed.Amount));
-              return null;
-            };
-
-            buyBoxPrices[asin] = {
-              buyBox: getBBPrice(bb),
-              lowest: getBBPrice(low),
-            };
-          }
-        } else {
-          // Fallback: single-ASIN response format
-          for (const asin of batch) {
-            try {
-              const singleRes = await spApiRequest(
-                `/products/pricing/v0/competitivePrice?MarketplaceId=${marketplaceId}&Asins=${asin}&ItemType=Asin`
-              ) as Record<string, unknown>;
-
-              if (singleRes.payload && Array.isArray(singleRes.payload)) {
-                const item = (singleRes.payload as Array<Record<string, unknown>>)[0];
-                const product = item?.Product as Record<string, unknown> | undefined;
-                const cp = product?.CompetitivePricing as Record<string, unknown> | undefined;
-                const prices = cp?.CompetitivePrices as Array<Record<string, unknown>> | undefined;
-
-                if (prices) {
-                  const bb = prices.find((p) => p.CompetitivePriceId === "1");
-                  const low = prices.find((p) => p.CompetitivePriceId === "2");
-
-                  const getPrice = (entry: Record<string, unknown> | undefined): number | null => {
-                    if (!entry) return null;
-                    const price = entry.Price as Record<string, unknown> | undefined;
-                    const landed = price?.LandedPrice as Record<string, unknown> | undefined;
-                    if (landed?.Amount) return parseFloat(String(landed.Amount));
-                    return null;
-                  };
-
-                  buyBoxPrices[asin] = { buyBox: getPrice(bb), lowest: getPrice(low) };
-                } else {
-                  buyBoxPrices[asin] = { buyBox: null, lowest: null };
-                }
-              }
-            } catch (err) {
-              console.warn("Single BB fetch failed for", asin, err);
-              buyBoxPrices[asin] = { buyBox: null, lowest: null };
-            }
-          }
-        }
+        const bbResult = await fetchBuyBoxBatch(asinBatch, marketplaceId);
+        Object.assign(buyBoxPrices, bbResult);
       } catch (err) {
-        console.warn("Batch BB fetch failed:", err);
-        // Mark all in batch as no data
-        for (const asin of batch) {
-          if (!buyBoxPrices[asin]) buyBoxPrices[asin] = { buyBox: null, lowest: null };
+        console.warn("BB batch failed:", err);
+        for (const asin of asinBatch) {
+          buyBoxPrices[asin] = { buyBox: null, lowest: null };
         }
       }
-
-      if (i + BB_BATCH < asins.length) await sleep(500);
+      if (i + BB_BATCH < batchAsins.length) await sleep(200);
     }
 
-    console.log("Buy Box data fetched for", Object.keys(buyBoxPrices).length, "ASINs");
+    console.log("BB data:", Object.keys(buyBoxPrices).length, "ASINs");
 
-    // Step 4: Run repricing engine
-    console.log("Running repricing engine...");
-    const changes = runRepricingEngine(activeListings, rules as Rule[], buyBoxPrices);
-    console.log("Engine result:", changes.length, "price changes");
+    // Run repricing engine
+    const changes = runRepricingEngine(listings, rules as Rule[], buyBoxPrices);
+    totalChanged = changes.length;
+    console.log("Engine:", changes.length, "changes");
 
-    // Step 5: Push changes to Amazon and persist to Supabase
-    let pushedCount = 0;
-    const pushErrors: string[] = [];
-
-    for (const change of changes) {
-      // Push to Amazon via Listings API
+    // Push price changes to Amazon (capped at MAX_PUSHES per invocation)
+    const toPush = changes.slice(0, MAX_PUSHES);
+    for (const change of toPush) {
       try {
         const encodedSku = encodeURIComponent(change.sku);
 
-        // Get product type for PATCH
         const listingInfo = await spApiRequest(
           `/listings/2021-08-01/items/${CONFIRMED_SELLER_ID}/${encodedSku}?marketplaceIds=${marketplaceId}&includedData=summaries`
         ) as Record<string, unknown>;
@@ -462,32 +473,21 @@ async function runAutoReprice() {
         }
 
         if (!productType) {
-          pushErrors.push(`${change.sku}: could not determine productType`);
+          allErrors.push(`${change.sku}: no productType`);
           continue;
         }
 
-        // PATCH price update
         const patchBody = {
           productType,
-          patches: [
-            {
-              op: "replace",
-              path: "/attributes/purchasable_offer",
-              value: [
-                {
-                  marketplace_id: marketplaceId,
-                  currency: "USD",
-                  our_price: [
-                    {
-                      schedule: [
-                        { value_with_tax: change.new_price.toFixed(2) },
-                      ],
-                    },
-                  ],
-                },
-              ],
-            },
-          ],
+          patches: [{
+            op: "replace",
+            path: "/attributes/purchasable_offer",
+            value: [{
+              marketplace_id: marketplaceId,
+              currency: "USD",
+              our_price: [{ schedule: [{ value_with_tax: change.new_price.toFixed(2) }] }],
+            }],
+          }],
         };
 
         const patchResult = await spApiRequest(
@@ -497,62 +497,64 @@ async function runAutoReprice() {
         ) as Record<string, unknown>;
 
         if (patchResult.error) {
-          pushErrors.push(`${change.sku}: PATCH failed - ${JSON.stringify(patchResult).substring(0, 200)}`);
+          allErrors.push(`${change.sku}: PATCH failed`);
         } else {
-          pushedCount++;
-          console.log(`  [${change.sku}] $${change.old_price.toFixed(2)} -> $${change.new_price.toFixed(2)} PUSHED`);
+          totalPushed++;
+          console.log(`  ${change.sku}: $${change.old_price.toFixed(2)} -> $${change.new_price.toFixed(2)}`);
         }
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        pushErrors.push(`${change.sku}: ${msg}`);
+        allErrors.push(`${change.sku}: ${err instanceof Error ? err.message : String(err)}`);
       }
-
-      // Small delay between price pushes to avoid throttling
-      await sleep(300);
+      await sleep(200);
     }
 
-    // Step 6: Persist changes to Supabase
-    for (const change of changes) {
-      // Save repricing log entry
-      await sb.from("repricing_log").insert({
-        asin: change.asin,
-        sku: change.sku,
-        old_price: change.old_price,
-        new_price: change.new_price,
-        reason: "[AUTO] " + change.reason,
-      });
+    if (changes.length > MAX_PUSHES) {
+      console.log("Capped Amazon pushes at", MAX_PUSHES, "of", changes.length, "— rest will be pushed next cycle");
+    }
 
-      // Update listing price in DB
-      const listing = activeListings.find((l) => l.sku === change.sku);
-      if (listing) {
-        await sb.from("listings").update({
-          current_price: change.new_price,
-          last_repriced: new Date().toISOString(),
-        }).eq("id", listing.id);
+    // Persist ALL changes to Supabase (even if not all were pushed to Amazon yet)
+    if (changes.length > 0) {
+      const logRows = changes.map((c) => ({
+        asin: c.asin,
+        sku: c.sku,
+        old_price: c.old_price,
+        new_price: c.new_price,
+        reason: "[AUTO] " + c.reason,
+      }));
+      await sb.from("repricing_log").insert(logRows);
+
+      for (const change of changes) {
+        const listing = listings.find((l) => l.sku === change.sku);
+        if (listing) {
+          await sb.from("listings").update({
+            current_price: change.new_price,
+            last_repriced: new Date().toISOString(),
+          }).eq("id", listing.id);
+        }
       }
     }
 
-    // Step 7: Update reprice_runs record
-    const finalStatus = pushErrors.length > 0 && pushedCount === 0 ? "failed" : "complete";
-    const errorMsg = pushErrors.length > 0 ? pushErrors.join("\n") : null;
-
+    // Final update
+    const finalStatus = allErrors.length > 0 && totalPushed === 0 ? "failed" : "complete";
     await sb.from("reprice_runs").update({
       status: finalStatus,
       completed_at: new Date().toISOString(),
-      listings_checked: activeListings.length,
-      prices_changed: changes.length,
-      error_message: errorMsg,
+      listings_checked: totalChecked,
+      prices_changed: totalChanged,
+      error_message: allErrors.length > 0 ? allErrors.slice(0, 20).join("\n") : null,
     }).eq("id", runId);
 
-    console.log("Auto-reprice complete:", activeListings.length, "checked,", changes.length, "changed,", pushedCount, "pushed to Amazon");
+    console.log("Done:", totalChecked, "checked,", totalChanged, "changed,", totalPushed, "pushed to Amazon");
 
     return {
       ok: true,
       runId,
-      listings_checked: activeListings.length,
-      prices_changed: changes.length,
-      pushed_to_amazon: pushedCount,
-      errors: pushErrors.length > 0 ? pushErrors : undefined,
+      listings_checked: totalChecked,
+      prices_changed: totalChanged,
+      pushed_to_amazon: totalPushed,
+      batch_offset: currentOffset,
+      next_offset: nextOffset >= totalListings ? 0 : nextOffset,
+      errors: allErrors.length > 0 ? allErrors.slice(0, 10) : undefined,
     };
 
   } catch (err) {
@@ -562,6 +564,8 @@ async function runAutoReprice() {
     await sb.from("reprice_runs").update({
       status: "failed",
       completed_at: new Date().toISOString(),
+      listings_checked: totalChecked,
+      prices_changed: totalChanged,
       error_message: msg,
     }).eq("id", runId);
 

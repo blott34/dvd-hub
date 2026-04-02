@@ -35,7 +35,8 @@
       "Bash(node:*)",
       "Bash(grep -o \"owner\" dist/assets/index-*.js)",
       "Bash(curl:*)",
-      "Bash(npx supabase:*)"
+      "Bash(npx supabase:*)",
+      "Bash(npx -y deno check \"C:\\\\Users\\\\bryce\\\\Documents\\\\dvd-hub\\\\supabase\\\\functions\\\\sp-api-reprice\\\\index.ts\")"
     ]
   }
 }
