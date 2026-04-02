@@ -203,9 +203,9 @@ function runRepricingEngine(
           reason = `Match Buy Box: BB $${bbPrice.toFixed(2)} above max, set to max $${listing.max_price.toFixed(2)}`;
         }
       } else {
-        const raised = Math.min(listing.current_price + nobbRaise, listing.max_price);
-        newPrice = parseFloat(raised.toFixed(2));
-        reason = `No Buy Box - incremental raise of $${nobbRaise.toFixed(2)}`;
+        // No Buy Box — hold current price, do nothing
+        newPrice = listing.current_price;
+        reason = null;
       }
     }
 

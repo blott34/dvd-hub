@@ -386,6 +386,22 @@ async function handleTestCatalog(asin: string): Promise<unknown> {
   return { action: "testCatalog", asin, result };
 }
 
+async function callSyncFunction(jobId: string): Promise<unknown> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+  const res = await fetch(`${supabaseUrl}/functions/v1/sp-api-sync`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${serviceKey}`,
+    },
+    body: JSON.stringify({ jobId }),
+  });
+
+  return res.json();
+}
+
 async function handleStartSync(): Promise<unknown> {
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -405,21 +421,17 @@ async function handleStartSync(): Promise<unknown> {
   const jobId = job.id;
   console.log("Created sync job:", jobId);
 
-  // Fire off the sp-api-sync function asynchronously
-  const syncFnUrl = `${supabaseUrl}/functions/v1/sp-api-sync`;
+  // Phase 1: request the report
+  const result = await callSyncFunction(jobId);
 
-  fetch(syncFnUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${serviceKey}`,
-    },
-    body: JSON.stringify({ jobId }),
-  }).catch((err) => {
-    console.error("Failed to invoke sp-api-sync:", err);
-  });
+  return { ok: true, jobId, message: "Report requested", result };
+}
 
-  return { ok: true, jobId, message: "Daily listing sync started" };
+async function handlePollSync(jobId: string): Promise<unknown> {
+  // Call sp-api-sync again for the same job — it will check report status
+  // and process if ready (Phase 2)
+  const result = await callSyncFunction(jobId);
+  return { ok: true, jobId, result };
 }
 
 async function handleGetSyncStatus(jobId?: string): Promise<unknown> {
@@ -507,6 +519,11 @@ serve(async (req: Request) => {
 
       case "startSync":
         result = await handleStartSync();
+        break;
+
+      case "pollSync":
+        if (!params.jobId) throw new Error("Missing required param: jobId");
+        result = await handlePollSync(params.jobId);
         break;
 
       case "getSyncStatus":

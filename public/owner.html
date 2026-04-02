@@ -1228,7 +1228,7 @@ async function handleTriggerDailySync() {
     if (btn) { btn.textContent = 'Syncing...'; }
 
     if (syncPollTimer) clearInterval(syncPollTimer);
-    syncPollTimer = setInterval(() => pollSyncStatus(jobId), 5000);
+    syncPollTimer = setInterval(() => pollSyncStatus(jobId), 15000);
 
   } catch (e) {
     if (status) { status.style.display = 'block'; status.style.background = '#2a0a0a'; status.style.color = '#ff4444'; status.style.borderColor = '#4a1a1a'; status.textContent = 'Sync error: ' + e.message; }
@@ -1241,6 +1241,7 @@ async function pollSyncStatus(jobId) {
   const status = document.getElementById('sync-status');
 
   try {
+    // First check current status
     const result = await callSpApi('getSyncStatus', { jobId });
 
     if (result.error) {
@@ -1252,12 +1253,14 @@ async function pollSyncStatus(jobId) {
     const elapsed = Math.round((Date.now() - new Date(s.started_at).getTime()) / 1000);
 
     if (s.status === 'running') {
+      // Trigger Phase 2 — this calls sp-api-sync again to check/process the report
+      callSpApi('pollSync', { jobId }).catch(() => {});
+
       let msg = 'Syncing... (' + elapsed + 's)';
       if (s.listings_synced > 0) msg = 'Upserting listings: ' + s.listings_synced + ' done (' + elapsed + 's)';
-      else if (s.ranks_fetched > 0) msg = 'Fetching sales ranks: ' + s.ranks_fetched + ' done (' + elapsed + 's)';
       else if (s.prices_fetched > 0) msg = 'Fetching live prices: ' + s.prices_fetched + ' done (' + elapsed + 's)';
-      else if (s.total_raw > 0) msg = 'Report downloaded: ' + s.total_raw + ' total listings. Filtering & fetching prices... (' + elapsed + 's)';
-      else msg = 'Waiting for Amazon report... (' + elapsed + 's)';
+      else if (s.total_raw > 0) msg = 'Report downloaded: ' + s.total_raw + ' total listings. Fetching prices... (' + elapsed + 's)';
+      else msg = 'Waiting for Amazon to generate report... (' + elapsed + 's)';
 
       if (status) { status.className = 'repricer-status info'; status.style.display = 'block'; status.textContent = msg; }
       if (btn) { btn.textContent = 'Syncing... ' + elapsed + 's'; }
