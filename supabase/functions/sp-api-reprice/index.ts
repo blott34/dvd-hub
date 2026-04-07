@@ -129,10 +129,18 @@ interface LogEntry {
   timestamp: string;
 }
 
+function getSkuPrefix(sku: string): "DVDBOX" | "WIIBOX" | null {
+  const upper = sku.toUpperCase();
+  if (upper.includes("DVDBOX")) return "DVDBOX";
+  if (upper.includes("WIIBOX")) return "WIIBOX";
+  return null;
+}
+
 function runRepricingEngine(
   listings: Listing[],
   rules: Rule[],
   buyBoxPrices: Record<string, BuyBoxData>,
+  dbUpdates: Array<{ id: string; max_price?: number; min_price?: number }>,
 ): LogEntry[] {
   const log: LogEntry[] = [];
   const now = new Date();
@@ -146,98 +154,105 @@ function runRepricingEngine(
     if (listing.status !== "active") continue;
     if (!SKU_FILTER.test(listing.sku)) continue;
 
+    const prefix = getSkuPrefix(listing.sku);
+    if (!prefix) continue;
+
     let newPrice = listing.current_price;
     let reason: string | null = null;
+    const appliedRules: string[] = [];
 
-    // Pre-pass: Max Hit Day 1
-    const maxHitRule = ruleMap["Max Hit Day 1"];
-    if (maxHitRule && maxHitRule.is_active) {
-      const dateListed = new Date(listing.date_listed + "T00:00:00");
-      const daysSinceListed = Math.floor((now.getTime() - dateListed.getTime()) / 86400000);
-      const raiseAmount = parseFloat(String(maxHitRule.max_hit_raise_amount)) || 3.0;
-      if (daysSinceListed === 0 && listing.current_price >= listing.max_price) {
-        listing.max_price = parseFloat((listing.max_price + raiseAmount).toFixed(2));
-      }
-      // Also: if day 0 and Buy Box is above max, raise max to match Buy Box
-      if (daysSinceListed === 0) {
-        const bbData = buyBoxPrices[listing.asin];
-        const bbPrice = bbData ? bbData.buyBox : null;
-        if (bbPrice != null && bbPrice > listing.max_price) {
-          listing.max_price = parseFloat(bbPrice.toFixed(2));
+    console.log(`[${prefix}] Processing ${listing.sku} (ASIN ${listing.asin}) current=$${listing.current_price.toFixed(2)} min=$${listing.min_price.toFixed(2)} max=$${listing.max_price.toFixed(2)}`);
+
+    // ---- DVDBOX: apply default min/max if not overridden ----
+    if (prefix === "DVDBOX") {
+      // Default min $8.50, max $24.99 — only if listing has no override
+      // (listings created by sync default to 8.50/24.99 already, but enforce here)
+      if (listing.min_price == null || listing.min_price === 0) listing.min_price = 8.50;
+      if (listing.max_price == null || listing.max_price === 0) listing.max_price = 24.99;
+    }
+
+    // ---- DVDBOX ONLY: Max Hit Day 1 ----
+    if (prefix === "DVDBOX") {
+      const maxHitRule = ruleMap["Max Hit Day 1"];
+      if (maxHitRule && maxHitRule.is_active) {
+        const dateListed = new Date(listing.date_listed + "T00:00:00");
+        const daysSinceListed = Math.floor((now.getTime() - dateListed.getTime()) / 86400000);
+        if (daysSinceListed === 0) {
+          const bbData = buyBoxPrices[listing.asin];
+          const bbPrice = bbData ? bbData.buyBox : null;
+          if (bbPrice != null && bbPrice > listing.max_price) {
+            const oldMax = listing.max_price;
+            listing.max_price = parseFloat(bbPrice.toFixed(2));
+            appliedRules.push(`Max Hit Day 1: raised max from $${oldMax.toFixed(2)} to $${listing.max_price.toFixed(2)} (BB above max on day 0)`);
+            // Persist the raised max_price to the database
+            dbUpdates.push({ id: listing.id, max_price: listing.max_price });
+          }
         }
       }
     }
 
-    // Pre-pass: Stale Inventory
-    const staleRule = ruleMap["Stale Inventory"];
-    if (staleRule && staleRule.is_active) {
-      const daysBefore = parseInt(String(staleRule.days_before_drop)) || 30;
-      const dropAmount = parseFloat(String(staleRule.drop_amount)) || 0.5;
-      const dateListed = new Date(listing.date_listed + "T00:00:00");
-      const daysActive = Math.floor((now.getTime() - dateListed.getTime()) / 86400000);
-      const lastSold = listing.last_sold ? new Date(listing.last_sold) : null;
-      const daysSinceSale = lastSold
-        ? Math.floor((now.getTime() - lastSold.getTime()) / 86400000)
-        : daysActive;
-      if (daysSinceSale >= daysBefore) {
-        listing.min_price = parseFloat((listing.min_price - dropAmount).toFixed(2));
-      }
-    }
-
-    // Rule 0: Match Buy Box
-    const matchBBRule = ruleMap["Match Buy Box"];
-    if (matchBBRule && matchBBRule.is_active) {
-      const bbData = buyBoxPrices[listing.asin];
-      const bbPrice = bbData ? bbData.buyBox : null;
-      const nobbRaise = parseFloat(String(matchBBRule.no_buybox_raise_amount)) || 1.0;
-
-      if (bbPrice != null) {
-        if (bbPrice >= listing.min_price && bbPrice <= listing.max_price) {
-          newPrice = bbPrice;
-          reason = `Match Buy Box: matched at $${bbPrice.toFixed(2)}`;
-        } else if (bbPrice < listing.min_price) {
-          newPrice = listing.min_price;
-          reason = `Match Buy Box: BB $${bbPrice.toFixed(2)} below min, set to min $${listing.min_price.toFixed(2)}`;
-        } else {
-          newPrice = listing.max_price;
-          reason = `Match Buy Box: BB $${bbPrice.toFixed(2)} above max, set to max $${listing.max_price.toFixed(2)}`;
+    // ---- DVDBOX ONLY: Stale Inventory ----
+    if (prefix === "DVDBOX") {
+      const staleRule = ruleMap["Stale Inventory"];
+      if (staleRule && staleRule.is_active) {
+        const daysBefore = parseInt(String(staleRule.days_before_drop)) || 30;
+        const dropAmount = parseFloat(String(staleRule.drop_amount)) || 0.5;
+        const dateListed = new Date(listing.date_listed + "T00:00:00");
+        const daysActive = Math.floor((now.getTime() - dateListed.getTime()) / 86400000);
+        const lastSold = listing.last_sold ? new Date(listing.last_sold) : null;
+        const daysSinceSale = lastSold
+          ? Math.floor((now.getTime() - lastSold.getTime()) / 86400000)
+          : daysActive;
+        if (daysSinceSale >= daysBefore) {
+          const oldMin = listing.min_price;
+          listing.min_price = parseFloat((listing.min_price - dropAmount).toFixed(2));
+          appliedRules.push(`Stale Inventory: dropped min from $${oldMin.toFixed(2)} to $${listing.min_price.toFixed(2)} (${daysSinceSale} days without sale)`);
+          dbUpdates.push({ id: listing.id, min_price: listing.min_price });
         }
-      } else {
-        // No Buy Box — hold current price, do nothing
-        newPrice = listing.current_price;
-        reason = null;
       }
     }
 
-    // Rule 1: Default Floors
-    const defaultFloors = ruleMap["Default Floors"];
-    if (defaultFloors && defaultFloors.is_active) {
-      if (newPrice < listing.min_price) {
+    // ---- BOTH: Match Buy Box ----
+    const bbData = buyBoxPrices[listing.asin];
+    const bbPrice = bbData ? bbData.buyBox : null;
+
+    if (bbPrice != null) {
+      if (bbPrice >= listing.min_price && bbPrice <= listing.max_price) {
+        newPrice = bbPrice;
+        reason = `Match Buy Box: matched at $${bbPrice.toFixed(2)}`;
+      } else if (bbPrice < listing.min_price) {
         newPrice = listing.min_price;
-        reason = "Default Floors: price below minimum, raised to min";
-      }
-      if (newPrice > listing.max_price) {
+        reason = `Match Buy Box: BB $${bbPrice.toFixed(2)} below min, set to min $${listing.min_price.toFixed(2)}`;
+      } else {
         newPrice = listing.max_price;
-        reason = "Default Floors: price above maximum, lowered to max";
+        reason = `Match Buy Box: BB $${bbPrice.toFixed(2)} above max, set to max $${listing.max_price.toFixed(2)}`;
       }
+      appliedRules.push(reason);
+    } else {
+      // No Buy Box or suppressed — hold current price for BOTH prefixes
+      newPrice = listing.current_price;
+      reason = null;
+      appliedRules.push("No Buy Box: holding current price");
     }
 
-    // Rule 4: Never Below Cost
+    // ---- BOTH: Never Below Cost ----
     const costRule = ruleMap["Never Below Cost"];
     if (costRule && costRule.is_active) {
       if (newPrice < listing.cost_basis) {
         newPrice = listing.cost_basis;
         reason = `Never Below Cost: floored at cost $${listing.cost_basis.toFixed(2)}`;
+        appliedRules.push(reason);
       }
     }
 
-    // Rule 5: Sales Rank Guard
+    // ---- BOTH: Sales Rank Guard ----
     const rankRule = ruleMap["Sales Rank Guard"];
     if (rankRule && rankRule.is_active) {
       const threshold = parseInt(String(rankRule.target_position)) || 500000;
       if (listing.sales_rank && listing.sales_rank > threshold && newPrice < listing.current_price) {
         newPrice = listing.current_price;
         reason = `Sales Rank Guard: rank ${listing.sales_rank.toLocaleString()} above ${threshold.toLocaleString()}, blocked downward reprice`;
+        appliedRules.push(reason);
       }
     }
 
@@ -246,20 +261,23 @@ function runRepricingEngine(
     newPrice = Math.min(newPrice, listing.max_price);
     newPrice = parseFloat(newPrice.toFixed(2));
 
-    // Hard cap: never exceed max_price regardless of earlier rule mutations
-    if (newPrice > listing.max_price) newPrice = listing.max_price;
+    console.log(`[${prefix}] ${listing.sku}: rules applied: ${appliedRules.join(" | ")}`);
 
     if (newPrice !== listing.current_price) {
+      const finalReason = `[${prefix}] ${reason || "Price adjusted within bounds"}`;
+      console.log(`[${prefix}] ${listing.sku}: $${listing.current_price.toFixed(2)} -> $${newPrice.toFixed(2)} (${finalReason})`);
       log.push({
         asin: listing.asin,
         sku: listing.sku,
         old_price: listing.current_price,
         new_price: newPrice,
-        reason: reason || "Price adjusted within bounds",
+        reason: finalReason,
         timestamp: now.toISOString(),
       });
       listing.current_price = newPrice;
       listing.last_repriced = now.toISOString();
+    } else {
+      console.log(`[${prefix}] ${listing.sku}: no change, holding at $${listing.current_price.toFixed(2)}`);
     }
   }
 
@@ -464,9 +482,20 @@ async function runAutoReprice() {
     console.log("BB data:", Object.keys(buyBoxPrices).length, "ASINs");
 
     // Run repricing engine
-    const changes = runRepricingEngine(listings, rules as Rule[], buyBoxPrices);
+    const dbUpdates: Array<{ id: string; max_price?: number; min_price?: number }> = [];
+    const changes = runRepricingEngine(listings, rules as Rule[], buyBoxPrices, dbUpdates);
     totalChanged = changes.length;
-    console.log("Engine:", changes.length, "changes");
+    console.log("Engine:", changes.length, "changes,", dbUpdates.length, "min/max DB updates");
+
+    // Persist any min/max adjustments from Max Hit Day 1 or Stale Inventory
+    if (dbUpdates.length > 0) {
+      for (const upd of dbUpdates) {
+        const fields: Record<string, number> = {};
+        if (upd.max_price != null) fields.max_price = upd.max_price;
+        if (upd.min_price != null) fields.min_price = upd.min_price;
+        await sb.from("listings").update(fields).eq("id", upd.id);
+      }
+    }
 
     // Push price changes to Amazon — ONLY in live mode
     if (liveMode) {
