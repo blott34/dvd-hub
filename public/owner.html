@@ -752,9 +752,16 @@ async function loadListingsFromDb() {
   return res.json();
 }
 
-// Load repricing log from Supabase
+// Load repricing log — all entries from the most recent reprice run
 async function loadRepricingLog() {
-  return await query('repricing_log', 'select=*&order=timestamp.desc&limit=50');
+  // Fetch the most recent entry to get its timestamp
+  const latest = await query('repricing_log', 'select=timestamp&order=timestamp.desc&limit=1');
+  if (!Array.isArray(latest) || latest.length === 0) return [];
+  // The repricer inserts all changes from a run with the same created_at,
+  // but individual timestamps may differ slightly. Use a 2-minute window.
+  const latestTime = new Date(latest[0].timestamp);
+  const windowStart = new Date(latestTime.getTime() - 120000).toISOString();
+  return await query('repricing_log', `select=*&order=timestamp.desc&timestamp=gte.${windowStart}`);
 }
 
 // Load repricing rules from Supabase
@@ -1055,22 +1062,25 @@ function renderRepricer() {
           </div>
         </div>
 
-        <!-- Quick log preview -->
-        ${repricerLog.length > 0 ? `
-          <h3 style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;margin-top:20px;">Recent Changes</h3>
+        <!-- Quick log preview — all changes from most recent run -->
+        ${repricerLog.length > 0 ? (() => {
+          const runTime = new Date(repricerLog[0].timestamp);
+          const runLabel = runTime.toLocaleDateString() + ' ' + runTime.toLocaleTimeString();
+          return `
+          <h3 style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;margin-top:20px;">Latest Run Changes (${repricerLog.length})</h3>
+          <div style="font-size:11px;color:#666;margin-bottom:10px;">Run at ${runLabel}</div>
           <div class="table-wrap"><table>
-            <thead><tr><th>Time</th><th>SKU</th><th>Old</th><th>New</th><th>Reason</th></tr></thead>
-            <tbody>${repricerLog.slice(0, 10).map(e => `
+            <thead><tr><th>SKU</th><th>Old</th><th>New</th><th>Reason</th></tr></thead>
+            <tbody>${repricerLog.map(e => `
               <tr>
-                <td>${new Date(e.timestamp).toLocaleTimeString()}</td>
                 <td>${esc(e.sku)}</td>
                 <td>$${e.old_price.toFixed(2)}</td>
                 <td class="${e.new_price > e.old_price ? 'price-up' : 'price-down'}">$${e.new_price.toFixed(2)}</td>
                 <td class="log-reason">${esc(e.reason)}</td>
               </tr>
             `).join('')}</tbody>
-          </table></div>
-        ` : '<div class="empty">No price changes yet. Automated repricing runs every 15 minutes.</div>'}
+          </table></div>`;
+        })() : '<div class="empty">No price changes yet. Automated repricing runs every 15 minutes.</div>'}
       </div>
 
       <!-- LISTINGS TAB -->
