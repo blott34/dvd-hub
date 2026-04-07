@@ -314,6 +314,12 @@ async function runSync(jobId: string) {
           status: "active",
         };
         if (l.price > 0) row.current_price = l.price;
+        // Set sensible min/max for WIIBOX listings based on current price
+        const isWiibox = /wiibox/i.test(l.sku);
+        if (isWiibox && l.price > 0) {
+          row.min_price = Math.max(parseFloat((l.price - 7).toFixed(2)), 8.50);
+          row.max_price = parseFloat((l.price + 12).toFixed(2));
+        }
         return row;
       });
 
