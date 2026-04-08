@@ -148,6 +148,7 @@ export function runRepricingEngine(listings, rules, buyBoxPrices = {}) {
     }
 
     // Final bounds
+    const preBounds = newPrice;
     newPrice = Math.max(newPrice, listing.min_price);
     newPrice = Math.min(newPrice, listing.max_price);
     // DVDBOX hard floor — suggested_price can never go below $8.50
@@ -155,6 +156,9 @@ export function runRepricingEngine(listings, rules, buyBoxPrices = {}) {
       newPrice = Math.max(newPrice, 8.50);
     }
     newPrice = parseFloat(newPrice.toFixed(2));
+    if (newPrice !== preBounds) {
+      reason = `Bounds clamp: $${preBounds.toFixed(2)} -> $${newPrice.toFixed(2)} (min=$${listing.min_price.toFixed(2)}, max=$${listing.max_price.toFixed(2)})`;
+    }
 
     if (newPrice !== listing.current_price) {
       log.push({
@@ -162,7 +166,7 @@ export function runRepricingEngine(listings, rules, buyBoxPrices = {}) {
         sku: listing.sku,
         old_price: listing.current_price,
         new_price: newPrice,
-        reason: `[${prefix}] ${reason || 'Price adjusted within bounds'}`,
+        reason: `[${prefix}] ${reason || 'No change reason'}`,
         timestamp: now.toISOString(),
       });
       listing.current_price = newPrice;
