@@ -159,13 +159,7 @@ function runRepricingEngine(
 
     console.log(`[${prefix}] Processing ${listing.sku} (ASIN ${listing.asin}) current=$${listing.current_price.toFixed(2)} min=$${listing.min_price.toFixed(2)} max=$${listing.max_price.toFixed(2)}`);
 
-    // ---- DVDBOX: apply default min/max if not overridden ----
-    if (prefix === "DVDBOX") {
-      // Default min $8.50, max $24.99 — only if listing has no override
-      // (listings created by sync default to 8.50/24.99 already, but enforce here)
-      if (listing.min_price == null || listing.min_price === 0) listing.min_price = 8.50;
-      if (listing.max_price == null || listing.max_price === 0) listing.max_price = 24.99;
-    }
+    // ---- DVDBOX: dynamic min/max computed from Buy Box in the Match Buy Box section below ----
 
     // ---- DVDBOX ONLY: Max Hit Day 1 ----
     if (prefix === "DVDBOX") {
@@ -208,27 +202,54 @@ function runRepricingEngine(
       }
     }
 
-    // ---- BOTH: Match Buy Box ----
+    // ---- Match Buy Box ----
     const bbData = buyBoxPrices[listing.asin];
     const bbPrice = bbData ? bbData.buyBox : null;
 
-    if (bbPrice != null) {
-      if (bbPrice >= listing.min_price && bbPrice <= listing.max_price) {
-        newPrice = bbPrice;
-        reason = `Match Buy Box: matched at $${bbPrice.toFixed(2)}`;
-      } else if (bbPrice < listing.min_price) {
-        newPrice = listing.min_price;
-        reason = `Match Buy Box: BB $${bbPrice.toFixed(2)} below min, set to min $${listing.min_price.toFixed(2)}`;
+    if (prefix === "DVDBOX") {
+      // DVDBOX: dynamic min/max derived from Buy Box price each run
+      const DVDBOX_HARD_FLOOR = 8.50;
+
+      if (bbPrice != null) {
+        const dynMin = parseFloat(Math.max(DVDBOX_HARD_FLOOR, bbPrice - 3.00).toFixed(2));
+        const dynMax = parseFloat((bbPrice + 10.00).toFixed(2));
+
+        // Persist dynamic bounds to listing and DB
+        listing.min_price = dynMin;
+        listing.max_price = dynMax;
+        dbUpdates.push({ id: listing.id, min_price: dynMin, max_price: dynMax });
+
+        // Target = match Buy Box directly, clamped to dynamic bounds
+        newPrice = Math.max(dynMin, Math.min(bbPrice, dynMax));
+        newPrice = parseFloat(newPrice.toFixed(2));
+        reason = `Match Buy Box: target $${bbPrice.toFixed(2)} (dynMin=$${dynMin.toFixed(2)}, dynMax=$${dynMax.toFixed(2)})`;
+        appliedRules.push(reason);
       } else {
-        newPrice = listing.max_price;
-        reason = `Match Buy Box: BB $${bbPrice.toFixed(2)} above max, set to max $${listing.max_price.toFixed(2)}`;
+        // No Buy Box — hold current price
+        newPrice = listing.current_price;
+        reason = null;
+        appliedRules.push("No Buy Box: holding current price");
       }
-      appliedRules.push(reason);
     } else {
-      // No Buy Box or suppressed — hold current price for BOTH prefixes
-      newPrice = listing.current_price;
-      reason = null;
-      appliedRules.push("No Buy Box: holding current price");
+      // WIIBOX: original min/max logic
+      if (bbPrice != null) {
+        if (bbPrice >= listing.min_price && bbPrice <= listing.max_price) {
+          newPrice = bbPrice;
+          reason = `Match Buy Box: matched at $${bbPrice.toFixed(2)}`;
+        } else if (bbPrice < listing.min_price) {
+          newPrice = listing.min_price;
+          reason = `Match Buy Box: BB $${bbPrice.toFixed(2)} below min, set to min $${listing.min_price.toFixed(2)}`;
+        } else {
+          newPrice = listing.max_price;
+          reason = `Match Buy Box: BB $${bbPrice.toFixed(2)} above max, set to max $${listing.max_price.toFixed(2)}`;
+        }
+        appliedRules.push(reason);
+      } else {
+        // No Buy Box — hold current price
+        newPrice = listing.current_price;
+        reason = null;
+        appliedRules.push("No Buy Box: holding current price");
+      }
     }
 
     // ---- BOTH: Never Below Cost ----
@@ -255,6 +276,10 @@ function runRepricingEngine(
     // Final bounds
     newPrice = Math.max(newPrice, listing.min_price);
     newPrice = Math.min(newPrice, listing.max_price);
+    // DVDBOX hard floor — suggested_price can never go below $8.50
+    if (prefix === "DVDBOX") {
+      newPrice = Math.max(newPrice, 8.50);
+    }
     newPrice = parseFloat(newPrice.toFixed(2));
 
     console.log(`[${prefix}] ${listing.sku}: rules applied: ${appliedRules.join(" | ")}`);
