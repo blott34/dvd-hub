@@ -104,8 +104,10 @@ export function runRepricingEngine(listings, rules, buyBoxPrices = {}) {
         newPrice = parseFloat(newPrice.toFixed(2));
         reason = `Match Buy Box: target $${bbPrice.toFixed(2)} (dynMin=$${dynMin.toFixed(2)}, dynMax=$${dynMax.toFixed(2)})`;
       } else {
-        // No Buy Box — hold current price
+        // No Buy Box — hold current price, widen bounds so clamp doesn't cap at old 24.99
         newPrice = listing.current_price;
+        listing.min_price = DVDBOX_HARD_FLOOR;
+        listing.max_price = Math.max(listing.current_price, listing.max_price);
         reason = null;
       }
     } else {

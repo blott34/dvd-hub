@@ -225,10 +225,13 @@ function runRepricingEngine(
         reason = `Match Buy Box: target $${bbPrice.toFixed(2)} (dynMin=$${dynMin.toFixed(2)}, dynMax=$${dynMax.toFixed(2)})`;
         appliedRules.push(reason);
       } else {
-        // No Buy Box — hold current price
+        // No Buy Box — hold current price, widen bounds so clamp doesn't cap at old 24.99
         newPrice = listing.current_price;
+        listing.min_price = DVDBOX_HARD_FLOOR;
+        listing.max_price = Math.max(listing.current_price, listing.max_price);
+        dbUpdates.push({ id: listing.id, min_price: DVDBOX_HARD_FLOOR, max_price: listing.max_price });
         reason = null;
-        appliedRules.push("No Buy Box: holding current price");
+        appliedRules.push(`No Buy Box: holding at $${listing.current_price.toFixed(2)} (min=$${listing.min_price.toFixed(2)}, max=$${listing.max_price.toFixed(2)})`);
       }
     } else {
       // WIIBOX: original min/max logic
@@ -577,9 +580,21 @@ async function runAutoReprice() {
     totalChanged = changes.length;
     console.log("Engine:", changes.length, "changes,", dbUpdates.length, "min/max DB updates");
 
+    // Merge duplicate dbUpdates per listing ID (last entry wins per field)
+    const mergedUpdates: Record<string, { id: string; min_price?: number; max_price?: number }> = {};
+    for (const upd of dbUpdates) {
+      if (!mergedUpdates[upd.id]) {
+        mergedUpdates[upd.id] = { id: upd.id };
+      }
+      if (upd.min_price != null) mergedUpdates[upd.id].min_price = upd.min_price;
+      if (upd.max_price != null) mergedUpdates[upd.id].max_price = upd.max_price;
+    }
+    const dedupedUpdates = Object.values(mergedUpdates);
+
     // Persist min/max adjustments in parallel batches
-    if (dbUpdates.length > 0) {
-      const updatePromises = dbUpdates.map((upd) => {
+    if (dedupedUpdates.length > 0) {
+      console.log(`Persisting min/max for ${dedupedUpdates.length} listings (merged from ${dbUpdates.length} entries)`);
+      const updatePromises = dedupedUpdates.map((upd) => {
         const fields: Record<string, number> = {};
         if (upd.max_price != null) fields.max_price = upd.max_price;
         if (upd.min_price != null) fields.min_price = upd.min_price;
