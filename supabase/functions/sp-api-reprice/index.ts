@@ -594,13 +594,29 @@ async function runAutoReprice() {
     // Persist min/max adjustments in parallel batches
     if (dedupedUpdates.length > 0) {
       console.log(`Persisting min/max for ${dedupedUpdates.length} listings (merged from ${dbUpdates.length} entries)`);
-      const updatePromises = dedupedUpdates.map((upd) => {
+      // Log first 5 updates for debugging
+      for (const sample of dedupedUpdates.slice(0, 5)) {
+        console.log(`  DB UPDATE: id=${sample.id} min_price=${sample.min_price} max_price=${sample.max_price}`);
+      }
+      let persistSuccess = 0;
+      let persistFail = 0;
+      const updatePromises = dedupedUpdates.map(async (upd) => {
         const fields: Record<string, number> = {};
         if (upd.max_price != null) fields.max_price = upd.max_price;
         if (upd.min_price != null) fields.min_price = upd.min_price;
-        return sb.from("listings").update(fields).eq("id", upd.id);
+        const { error, count } = await sb
+          .from("listings")
+          .update(fields)
+          .eq("id", upd.id);
+        if (error) {
+          persistFail++;
+          console.error(`  PERSIST FAILED id=${upd.id}: ${error.message} (code=${error.code})`);
+        } else {
+          persistSuccess++;
+        }
       });
       await Promise.all(updatePromises);
+      console.log(`Persist results: ${persistSuccess} success, ${persistFail} failed out of ${dedupedUpdates.length}`);
     }
 
     // Push price changes to Amazon — ONLY in live mode, with concurrency control
