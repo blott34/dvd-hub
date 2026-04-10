@@ -552,6 +552,11 @@ async function runAutoReprice() {
   let totalChecked = 0;
   let totalChanged = 0;
   let totalPushed = 0;
+  let persistAttempted = 0;
+  let persistSuccess = 0;
+  let persistFail = 0;
+  let persistNoMatch = 0;
+  const persistErrors: string[] = [];
   const allErrors: string[] = [];
 
   try {
@@ -592,31 +597,47 @@ async function runAutoReprice() {
     const dedupedUpdates = Object.values(mergedUpdates);
 
     // Persist min/max adjustments in parallel batches
+    persistAttempted = dedupedUpdates.length;
     if (dedupedUpdates.length > 0) {
       console.log(`Persisting min/max for ${dedupedUpdates.length} listings (merged from ${dbUpdates.length} entries)`);
       // Log first 5 updates for debugging
       for (const sample of dedupedUpdates.slice(0, 5)) {
         console.log(`  DB UPDATE: id=${sample.id} min_price=${sample.min_price} max_price=${sample.max_price}`);
       }
-      let persistSuccess = 0;
-      let persistFail = 0;
       const updatePromises = dedupedUpdates.map(async (upd) => {
         const fields: Record<string, number> = {};
         if (upd.max_price != null) fields.max_price = upd.max_price;
         if (upd.min_price != null) fields.min_price = upd.min_price;
-        const { error, count } = await sb
-          .from("listings")
-          .update(fields)
-          .eq("id", upd.id);
-        if (error) {
+        try {
+          // .select("id") forces the update to return affected rows so we can
+          // detect silent 0-row updates (e.g. id mismatch, RLS block).
+          const { data, error } = await sb
+            .from("listings")
+            .update(fields)
+            .eq("id", upd.id)
+            .select("id");
+          if (error) {
+            persistFail++;
+            const msg = `PERSIST FAILED id=${upd.id}: ${error.message} (code=${error.code})`;
+            console.error(`  ${msg}`);
+            if (persistErrors.length < 10) persistErrors.push(msg);
+          } else if (!data || data.length === 0) {
+            persistNoMatch++;
+            const msg = `PERSIST NO-MATCH id=${upd.id}: update returned 0 rows (fields=${JSON.stringify(fields)})`;
+            console.error(`  ${msg}`);
+            if (persistErrors.length < 10) persistErrors.push(msg);
+          } else {
+            persistSuccess++;
+          }
+        } catch (e) {
           persistFail++;
-          console.error(`  PERSIST FAILED id=${upd.id}: ${error.message} (code=${error.code})`);
-        } else {
-          persistSuccess++;
+          const msg = `PERSIST THREW id=${upd.id}: ${e instanceof Error ? e.message : String(e)}`;
+          console.error(`  ${msg}`);
+          if (persistErrors.length < 10) persistErrors.push(msg);
         }
       });
       await Promise.all(updatePromises);
-      console.log(`Persist results: ${persistSuccess} success, ${persistFail} failed out of ${dedupedUpdates.length}`);
+      console.log(`Persist results: ${persistSuccess} success, ${persistNoMatch} no-match, ${persistFail} failed out of ${dedupedUpdates.length}`);
     }
 
     // Push price changes to Amazon — ONLY in live mode, with concurrency control
@@ -694,6 +715,13 @@ async function runAutoReprice() {
       listings_checked: totalChecked,
       prices_changed: totalChanged,
       pushed_to_amazon: totalPushed,
+      persist: {
+        attempted: persistAttempted,
+        success: persistSuccess,
+        no_match: persistNoMatch,
+        failed: persistFail,
+        errors: persistErrors.length > 0 ? persistErrors : undefined,
+      },
       errors: allErrors.length > 0 ? allErrors.slice(0, 10) : undefined,
     };
 
