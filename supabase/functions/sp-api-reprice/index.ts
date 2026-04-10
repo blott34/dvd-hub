@@ -136,10 +136,11 @@ function runRepricingEngine(
   listings: Listing[],
   rules: Rule[],
   buyBoxPrices: Record<string, BuyBoxData>,
-  dbUpdates: Array<{ id: string; max_price?: number; min_price?: number }>,
+  dbUpdates: Array<{ id: string; max_price?: number; min_price?: number; last_repriced?: string }>,
 ): LogEntry[] {
   const log: LogEntry[] = [];
   const now = new Date();
+  const nowIso = now.toISOString();
 
   const ruleMap: Record<string, Rule> = {};
   for (const r of rules) {
@@ -152,6 +153,11 @@ function runRepricingEngine(
 
     const prefix = getSkuPrefix(listing.sku);
     if (!prefix) continue;
+
+    // Every listing that the engine actually evaluates gets a last_repriced
+    // stamp in the DB, regardless of live_mode or whether the price changed.
+    // This lets the UI show when each listing was last touched by the engine.
+    dbUpdates.push({ id: listing.id, last_repriced: nowIso });
 
     let newPrice = listing.current_price;
     let reason: string | null = null;
@@ -656,34 +662,36 @@ async function runAutoReprice() {
     const buyBoxPrices = await fetchAllBuyBoxes(allAsins, marketplaceId);
 
     // Run repricing engine
-    const dbUpdates: Array<{ id: string; max_price?: number; min_price?: number }> = [];
+    const dbUpdates: Array<{ id: string; max_price?: number; min_price?: number; last_repriced?: string }> = [];
     const changes = runRepricingEngine(listings, rules as Rule[], buyBoxPrices, dbUpdates);
     totalChanged = changes.length;
-    console.log("Engine:", changes.length, "changes,", dbUpdates.length, "min/max DB updates");
+    console.log("Engine:", changes.length, "changes,", dbUpdates.length, "DB updates (min/max/last_repriced)");
 
     // Merge duplicate dbUpdates per listing ID (last entry wins per field)
-    const mergedUpdates: Record<string, { id: string; min_price?: number; max_price?: number }> = {};
+    const mergedUpdates: Record<string, { id: string; min_price?: number; max_price?: number; last_repriced?: string }> = {};
     for (const upd of dbUpdates) {
       if (!mergedUpdates[upd.id]) {
         mergedUpdates[upd.id] = { id: upd.id };
       }
       if (upd.min_price != null) mergedUpdates[upd.id].min_price = upd.min_price;
       if (upd.max_price != null) mergedUpdates[upd.id].max_price = upd.max_price;
+      if (upd.last_repriced != null) mergedUpdates[upd.id].last_repriced = upd.last_repriced;
     }
     const dedupedUpdates = Object.values(mergedUpdates);
 
-    // Persist min/max adjustments in parallel batches
+    // Persist min/max + last_repriced adjustments in parallel batches
     persistAttempted = dedupedUpdates.length;
     if (dedupedUpdates.length > 0) {
-      console.log(`Persisting min/max for ${dedupedUpdates.length} listings (merged from ${dbUpdates.length} entries)`);
+      console.log(`Persisting ${dedupedUpdates.length} listings (merged from ${dbUpdates.length} entries)`);
       // Log first 5 updates for debugging
       for (const sample of dedupedUpdates.slice(0, 5)) {
-        console.log(`  DB UPDATE: id=${sample.id} min_price=${sample.min_price} max_price=${sample.max_price}`);
+        console.log(`  DB UPDATE: id=${sample.id} min_price=${sample.min_price} max_price=${sample.max_price} last_repriced=${sample.last_repriced}`);
       }
       const updatePromises = dedupedUpdates.map(async (upd) => {
-        const fields: Record<string, number> = {};
+        const fields: Record<string, number | string> = {};
         if (upd.max_price != null) fields.max_price = upd.max_price;
         if (upd.min_price != null) fields.min_price = upd.min_price;
+        if (upd.last_repriced != null) fields.last_repriced = upd.last_repriced;
         try {
           // .select("id") forces the update to return affected rows so we can
           // detect silent 0-row updates (e.g. id mismatch, RLS block).

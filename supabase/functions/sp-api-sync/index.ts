@@ -97,6 +97,7 @@ interface TsvListing {
   asin: string;
   title: string;
   price: number;
+  salesRank?: number | null;
 }
 
 function parseTsv(tsv: string): TsvListing[] {
@@ -283,9 +284,24 @@ async function runSync(jobId: string) {
               if (rp) { const amt = parseFloat(rp.Amount as string || "0"); if (amt > 0) livePrice = amt; }
             }
 
-            if (livePrice !== null) {
-              const listing = filtered.find((l) => l.sku === sku);
-              if (listing) { listing.price = livePrice; pricesFetched++; }
+            // Sales rank comes back in the same response under Product.SalesRankings.
+            // First entry is usually the main product category rank (e.g.
+            // "dvd_display_on_website") which is what we want for the UI.
+            let salesRank: number | null = null;
+            const salesRankings = product.SalesRankings as Array<Record<string, unknown>> | undefined;
+            if (Array.isArray(salesRankings) && salesRankings.length > 0) {
+              const first = salesRankings[0];
+              const rankVal = first?.Rank;
+              if (rankVal != null) {
+                const parsed = parseInt(String(rankVal), 10);
+                if (!isNaN(parsed) && parsed > 0) salesRank = parsed;
+              }
+            }
+
+            const listing = filtered.find((l) => l.sku === sku);
+            if (listing) {
+              if (livePrice !== null) { listing.price = livePrice; pricesFetched++; }
+              if (salesRank !== null) listing.salesRank = salesRank;
             }
           }
         }
@@ -314,6 +330,7 @@ async function runSync(jobId: string) {
           status: "active",
         };
         if (l.price > 0) row.current_price = l.price;
+        if (l.salesRank != null) row.sales_rank = l.salesRank;
         // Set sensible min/max for WIIBOX listings based on current price
         const isWiibox = /wiibox/i.test(l.sku);
         if (isWiibox && l.price > 0) {
