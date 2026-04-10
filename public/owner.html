@@ -748,9 +748,10 @@ async function loadListingsFromDb() {
   const PAGE = 1000;
   const all = [];
   let offset = 0;
-  const cacheBust = Date.now();
   while (true) {
-    const url = `${SUPABASE_URL}/rest/v1/listings?select=*&status=eq.active&or=(sku.ilike.*dvdbox*,sku.ilike.*wiibox*)&order=sku.asc&_=${cacheBust}`;
+    // Do NOT add a query-string cache buster — PostgREST treats unknown params
+    // as column filters and returns 400. Use Cache-Control headers only.
+    const url = `${SUPABASE_URL}/rest/v1/listings?select=*&status=eq.active&or=(sku.ilike.*dvdbox*,sku.ilike.*wiibox*)&order=sku.asc`;
     const res = await fetch(url, {
       cache: 'no-store',
       headers: {
