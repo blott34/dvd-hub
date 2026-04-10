@@ -315,55 +315,131 @@ function runRepricingEngine(
 
 // ---- Buy Box fetch helper (batch only, no single-ASIN fallback) ----
 
+
+/**
+ * Pull a price value from a CompetitivePrices entry.
+ * Prefers LandedPrice (what buyers actually pay), falls back to
+ * ListingPrice + Shipping if LandedPrice is missing (some sellers don't
+ * report landed price for FBM offers).
+ */
+function extractPriceFromEntry(entry: Record<string, unknown> | undefined): number | null {
+  if (!entry) return null;
+  const price = entry.Price as Record<string, unknown> | undefined;
+  if (!price) return null;
+
+  const landed = price.LandedPrice as Record<string, unknown> | undefined;
+  if (landed && landed.Amount != null) {
+    const amt = parseFloat(String(landed.Amount));
+    if (!isNaN(amt) && amt > 0) return amt;
+  }
+
+  const listing = price.ListingPrice as Record<string, unknown> | undefined;
+  if (listing && listing.Amount != null) {
+    const listAmt = parseFloat(String(listing.Amount));
+    const shipping = price.Shipping as Record<string, unknown> | undefined;
+    const shipAmt = shipping && shipping.Amount != null ? parseFloat(String(shipping.Amount)) : 0;
+    if (!isNaN(listAmt) && listAmt > 0) return listAmt + (isNaN(shipAmt) ? 0 : shipAmt);
+  }
+
+  return null;
+}
+
+/**
+ * Parse one batch sub-response into { asin, buyBox, lowest }.
+ *
+ * Defensive against two real shapes observed in SP-API:
+ *   A) body.payload is an OBJECT with CompetitivePricing at the root
+ *      { payload: { ASIN, CompetitivePricing: { CompetitivePrices: [...] } } }
+ *   B) body.payload is an ARRAY and CompetitivePricing is nested under Product
+ *      { payload: [ { ASIN, Product: { CompetitivePricing: { CompetitivePrices: [...] } } } ] }
+ *
+ * The non-batch endpoint uses shape B. The batch endpoint has been observed
+ * in both shapes across SP-API regions/versions, so we handle either.
+ */
+function parseCompetitivePricePayload(
+  respBody: Record<string, unknown> | undefined
+): { asin: string | null; buyBox: number | null; lowest: number | null } {
+  if (!respBody) return { asin: null, buyBox: null, lowest: null };
+
+  // Unwrap payload which may be array-of-one or a single object.
+  let payloadNode: Record<string, unknown> | undefined;
+  const raw = respBody.payload;
+  if (Array.isArray(raw)) {
+    payloadNode = raw[0] as Record<string, unknown> | undefined;
+  } else {
+    payloadNode = raw as Record<string, unknown> | undefined;
+  }
+  if (!payloadNode) return { asin: null, buyBox: null, lowest: null };
+
+  const asin = ((payloadNode.ASIN || payloadNode.asin) as string) || null;
+
+  // CompetitivePricing may be at payload root OR nested under Product.
+  let competitivePricing = payloadNode.CompetitivePricing as Record<string, unknown> | undefined;
+  if (!competitivePricing) {
+    const product = payloadNode.Product as Record<string, unknown> | undefined;
+    competitivePricing = product?.CompetitivePricing as Record<string, unknown> | undefined;
+  }
+  if (!competitivePricing) return { asin, buyBox: null, lowest: null };
+
+  const prices = competitivePricing.CompetitivePrices as Array<Record<string, unknown>> | undefined;
+  if (!prices || prices.length === 0) return { asin, buyBox: null, lowest: null };
+
+  // CompetitivePriceId: "1" = Buy Box, "2" = Lowest. Amazon historically sends
+  // these as strings, but we compare loosely to tolerate number form too.
+  const idMatches = (entry: Record<string, unknown>, id: string) =>
+    String(entry.CompetitivePriceId) === id;
+
+  const bb = prices.find((p) => idMatches(p, "1"));
+  const low = prices.find((p) => idMatches(p, "2"));
+
+  return {
+    asin,
+    buyBox: extractPriceFromEntry(bb),
+    lowest: extractPriceFromEntry(low),
+  };
+}
+
 async function fetchBuyBoxBatch(
   asins: string[],
   marketplaceId: string,
 ): Promise<Record<string, BuyBoxData>> {
   const result: Record<string, BuyBoxData> = {};
+  if (asins.length === 0) return result;
 
-  const requests = asins.map((asin) => ({
-    MarketplaceId: marketplaceId,
-    Asin: asin,
-    ItemType: "Asin",
-  }));
+  // Use the GET /products/pricing/v0/competitivePrice endpoint, which accepts
+  // up to 20 comma-separated ASINs in a single call. We previously used
+  // POST /batches/products/pricing/v0/competitivePrice, but SP-API returns
+  // 403 Unauthorized for that path — the batch variant either doesn't exist
+  // for competitivePrice or requires a role we don't have. The single-GET
+  // variant uses the same underlying Pricing API role.
+  const asinsParam = asins.map(encodeURIComponent).join(",");
+  const path = `/products/pricing/v0/competitivePrice?MarketplaceId=${marketplaceId}&Asins=${asinsParam}&ItemType=Asin`;
 
-  const apiRes = await spApiRequest(
-    "/batches/products/pricing/v0/competitivePrice",
-    "POST",
-    { requests }
-  ) as Record<string, unknown>;
+  const apiRes = await spApiRequest(path) as Record<string, unknown>;
 
-  const responses = apiRes.responses as Array<Record<string, unknown>> | undefined;
-  if (responses && Array.isArray(responses)) {
-    for (const resp of responses) {
-      const respBody = resp.body as Record<string, unknown> | undefined;
-      if (!respBody) continue;
-      const payload = respBody.payload as Record<string, unknown> | undefined;
-      if (!payload) continue;
+  // If the request errored (e.g. 403, rate-limited), fall through and mark
+  // every ASIN as no-data. The caller will hold prices on the no-BB path.
+  if (apiRes.error) {
+    for (const asin of asins) result[asin] = { buyBox: null, lowest: null };
+    return result;
+  }
 
-      const asin = (payload.ASIN || payload.asin) as string;
-      if (!asin) continue;
+  // Response shape: { payload: [ { ASIN, status, Product: { CompetitivePricing: {...} } }, ... ] }
+  // Also tolerant of an object payload or a payload with CompetitivePricing at
+  // the root — see parseCompetitivePricePayload for both shapes.
+  const payloadArr = apiRes.payload as Array<Record<string, unknown>> | Record<string, unknown> | undefined;
+  const entries: Array<Record<string, unknown>> = Array.isArray(payloadArr)
+    ? payloadArr
+    : payloadArr
+      ? [payloadArr]
+      : [];
 
-      const competitivePricing = payload.CompetitivePricing as Record<string, unknown> | undefined;
-      const prices = competitivePricing?.CompetitivePrices as Array<Record<string, unknown>> | undefined;
-      if (!prices) {
-        result[asin] = { buyBox: null, lowest: null };
-        continue;
-      }
-
-      const bb = prices.find((p) => p.CompetitivePriceId === "1");
-      const low = prices.find((p) => p.CompetitivePriceId === "2");
-
-      const getPrice = (entry: Record<string, unknown> | undefined): number | null => {
-        if (!entry) return null;
-        const price = entry.Price as Record<string, unknown> | undefined;
-        const landed = price?.LandedPrice as Record<string, unknown> | undefined;
-        if (landed?.Amount) return parseFloat(String(landed.Amount));
-        return null;
-      };
-
-      result[asin] = { buyBox: getPrice(bb), lowest: getPrice(low) };
-    }
+  for (const entry of entries) {
+    // Each entry from the GET endpoint is already "the payload" — wrap it so
+    // parseCompetitivePricePayload can do its normal work.
+    const parsed = parseCompetitivePricePayload({ payload: entry });
+    if (!parsed.asin) continue;
+    result[parsed.asin] = { buyBox: parsed.buyBox, lowest: parsed.lowest };
   }
 
   // Fill in any missing ASINs as no-data
