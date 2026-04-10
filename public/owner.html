@@ -903,6 +903,8 @@ let lastRepriceRun = null;
 let lastDailySync = null;
 let activeListingCount = 0;
 let currentOwnerTab = 'home';
+// SKU filter for the repricer Listings tab: 'all' | 'dvdbox' | 'wiibox'
+let listingsSkuFilter = 'all';
 
 function switchOwnerTab(tab) {
   currentOwnerTab = tab;
@@ -1132,28 +1134,7 @@ function renderRepricer() {
 
       <!-- LISTINGS TAB -->
       <div class="repricer-tab" id="repricer-listings">
-        <div class="table-wrap"><table>
-          <thead><tr>
-            <th>ASIN</th><th>SKU</th><th>Title</th><th>Price</th><th>Min</th><th>Max</th><th>Rank</th><th>Days Active</th><th>Last Repriced</th>
-          </tr></thead>
-          <tbody>${repricerListings.map(l => {
-            const daysActive = Math.floor((now - new Date(l.date_listed + 'T00:00:00')) / 86400000);
-            const repriced = l.last_repriced ? new Date(l.last_repriced).toLocaleDateString() : '--';
-            const atMinCls = l.current_price <= l.min_price ? ' red' : '';
-            const atMaxCls = l.current_price >= l.max_price ? ' green' : '';
-            return `<tr>
-              <td style="font-family:monospace;font-size:12px;">${esc(l.asin)}</td>
-              <td>${esc(l.sku)}</td>
-              <td>${esc(l.title)}</td>
-              <td class="${atMinCls}${atMaxCls}" style="font-weight:600;">$${l.current_price.toFixed(2)}</td>
-              <td>$${l.min_price.toFixed(2)}</td>
-              <td>$${l.max_price.toFixed(2)}</td>
-              <td>${l.sales_rank ? l.sales_rank.toLocaleString() : '--'}</td>
-              <td>${daysActive}d</td>
-              <td>${repriced}</td>
-            </tr>`;
-          }).join('')}</tbody>
-        </table></div>
+        ${renderListingsTabBody()}
       </div>
 
       <!-- RULES TAB -->
@@ -1239,6 +1220,60 @@ function switchRepricerTab(tab) {
   if (idx >= 0) {
     document.querySelectorAll('.repricer-nav button')[idx].classList.add('active');
   }
+}
+
+// Render the inner contents of the Listings tab (filter bar + table).
+// Extracted so setListingsSkuFilter() can re-render just this tab without
+// touching the rest of the repricer section or losing the active tab.
+function renderListingsTabBody() {
+  const now = new Date();
+  const f = listingsSkuFilter;
+  const filtered = repricerListings.filter(l => {
+    if (f === 'all') return true;
+    const sku = String(l.sku || '').toLowerCase();
+    if (f === 'dvdbox') return sku.includes('dvdbox');
+    if (f === 'wiibox') return sku.includes('wiibox');
+    return true;
+  });
+  const btn = (val, label) =>
+    `<button type="button" onclick="setListingsSkuFilter('${val}')" class="btn-reprice ${f === val ? '' : 'secondary'}" style="padding:6px 14px;font-size:12px;">${label}</button>`;
+  return `
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;">
+      <span style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:0.5px;">Filter:</span>
+      ${btn('all', 'All')}
+      ${btn('dvdbox', 'DVDBOX only')}
+      ${btn('wiibox', 'WIIBOX only')}
+      <span style="font-size:12px;color:#666;margin-left:8px;">Showing ${filtered.length.toLocaleString()} of ${repricerListings.length.toLocaleString()}</span>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr>
+        <th>ASIN</th><th>SKU</th><th>Title</th><th>Price</th><th>Min</th><th>Max</th><th>Rank</th><th>Days Active</th><th>Last Repriced</th>
+      </tr></thead>
+      <tbody>${filtered.map(l => {
+        const daysActive = Math.floor((now - new Date(l.date_listed + 'T00:00:00')) / 86400000);
+        const repriced = l.last_repriced ? new Date(l.last_repriced).toLocaleDateString() : '--';
+        const atMinCls = l.current_price <= l.min_price ? ' red' : '';
+        const atMaxCls = l.current_price >= l.max_price ? ' green' : '';
+        return `<tr>
+          <td style="font-family:monospace;font-size:12px;">${esc(l.asin)}</td>
+          <td>${esc(l.sku)}</td>
+          <td>${esc(l.title)}</td>
+          <td class="${atMinCls}${atMaxCls}" style="font-weight:600;">$${l.current_price.toFixed(2)}</td>
+          <td>$${l.min_price.toFixed(2)}</td>
+          <td>$${l.max_price.toFixed(2)}</td>
+          <td>${l.sales_rank ? l.sales_rank.toLocaleString() : '--'}</td>
+          <td>${daysActive}d</td>
+          <td>${repriced}</td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table></div>
+  `;
+}
+
+function setListingsSkuFilter(filter) {
+  listingsSkuFilter = filter;
+  const el = document.getElementById('repricer-listings');
+  if (el) el.innerHTML = renderListingsTabBody();
 }
 
 function toggleRule(index, active) {
