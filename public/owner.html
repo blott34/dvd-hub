@@ -662,6 +662,33 @@ async function query(table, params = '') {
   return res.json();
 }
 
+// Paginated query — walks past PostgREST's db-max-rows cap (1000) by
+// requesting successive Range windows until a short page is returned.
+// Use for tables that can exceed 1000 rows per query (e.g. daily_log over
+// a multi-day pay period).
+async function queryAll(table, params = '') {
+  const PAGE = 1000;
+  const all = [];
+  let offset = 0;
+  while (true) {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${params}`, {
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Range-Unit': 'items',
+        'Range': `${offset}-${offset + PAGE - 1}`,
+      },
+    });
+    const page = await res.json();
+    if (!Array.isArray(page) || page.length === 0) break;
+    all.push(...page);
+    if (page.length < PAGE) break;
+    offset += PAGE;
+    if (offset > 100000) break; // hard safety cap
+  }
+  return all;
+}
+
 // Pay period: 10 work days, Monday through following Friday (2 calendar weeks).
 // Anchor: Monday March 16, 2026 is a known pay period start.
 // Cycle: 14 calendar days. Start = Monday of cycle. End = start + 11 (Friday of week 2).
@@ -1371,7 +1398,9 @@ async function loadDashboard() {
     batches, shipCosts, supplies,
   ] = await Promise.all([
     query('daily_log', `select=result&timestamp=gte.${sod}`),
-    query('daily_log', `select=result,timestamp&timestamp=gte.${pp.start}T00:00:00&timestamp=lte.${pp.end}T23:59:59`),
+    // Pay-period daily_log can exceed PostgREST's 1000-row cap across 10
+    // business days — paginate to get the true scan total.
+    queryAll('daily_log', `select=result,timestamp&timestamp=gte.${pp.start}T00:00:00&timestamp=lte.${pp.end}T23:59:59`),
     query('shipments_completed', `select=id&date=eq.${today}`),
     query('shipments_completed', `select=id&date=gte.${pp.start}&date=lte.${pp.end}`),
     query('timesheet', `select=*&date=eq.${today}&order=time_in.asc`),
