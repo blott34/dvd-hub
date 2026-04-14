@@ -60,7 +60,9 @@ async function getAccessToken(): Promise<string> {
   return cachedToken.token;
 }
 
-async function spApiGet(path: string): Promise<unknown> {
+async function spApiGet(
+  path: string,
+): Promise<Record<string, unknown> & { __status?: number; __retryAfter?: number | null }> {
   const token = await getAccessToken();
   const url = `${SP_API_BASE}${path}`;
   console.log("GET", url);
@@ -70,9 +72,62 @@ async function spApiGet(path: string): Promise<unknown> {
   const body = await res.text();
   if (!res.ok) {
     console.error("SP-API error", res.status, body);
-    return { error: true, status: res.status, message: body };
+    const retryAfterHeader = res.headers.get("Retry-After");
+    const retryAfter = retryAfterHeader ? parseFloat(retryAfterHeader) : null;
+    return {
+      error: true,
+      status: res.status,
+      message: body,
+      __status: res.status,
+      __retryAfter: Number.isFinite(retryAfter) ? retryAfter : null,
+    };
   }
-  try { return JSON.parse(body); } catch { return { raw: body }; }
+  try {
+    return JSON.parse(body);
+  } catch {
+    return { raw: body };
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchPageWithRetry(
+  path: string,
+  page: number,
+): Promise<Record<string, unknown>> {
+  const MAX_RETRIES = 5;
+  let attempt = 0;
+  let backoffSec = 2;
+  while (true) {
+    const res = await spApiGet(path);
+    if (!res.error) return res;
+
+    if (res.__status !== 429) {
+      throw new Error(
+        "FBA inventory fetch failed (page " + page + "): " +
+          JSON.stringify(res.message ?? res).slice(0, 300),
+      );
+    }
+
+    if (attempt >= MAX_RETRIES) {
+      throw new Error(
+        "FBA inventory fetch 429 exhausted retries (page " + page + ", " +
+          MAX_RETRIES + " attempts)",
+      );
+    }
+
+    const waitSec = res.__retryAfter && res.__retryAfter > 0
+      ? res.__retryAfter
+      : backoffSec;
+    attempt++;
+    console.log(
+      `429 on page ${page}, retry attempt ${attempt}/${MAX_RETRIES}, waiting ${waitSec}s`,
+    );
+    await sleep(waitSec * 1000);
+    if (!res.__retryAfter) backoffSec *= 2;
+  }
 }
 
 function toInt(v: unknown): number {
@@ -114,9 +169,10 @@ async function runInventorySync() {
   }
   console.log("Loaded existing SKUs:", existingSkus.size);
 
-  const rows: InventoryRow[] = [];
   let totalFetched = 0;
   let totalUnmatchedSkus = 0;
+  let totalMatched = 0;
+  let totalUpserted = 0;
   const nowIso = new Date().toISOString();
 
   const basePath =
@@ -129,17 +185,14 @@ async function runInventorySync() {
   let page = 0;
   do {
     page++;
+    if (nextToken) {
+      await sleep(600);
+    }
     const path = nextToken
       ? `${basePath}&nextToken=${encodeURIComponent(nextToken)}`
       : basePath;
 
-    const res = await spApiGet(path) as Record<string, unknown>;
-    if (res.error) {
-      throw new Error(
-        "FBA inventory fetch failed (page " + page + "): " +
-          JSON.stringify(res.message ?? res).slice(0, 300),
-      );
-    }
+    const res = await fetchPageWithRetry(path, page);
 
     const payload = res.payload as Record<string, unknown> | undefined;
     const summaries =
@@ -149,6 +202,7 @@ async function runInventorySync() {
 
     console.log(`Page ${page}: ${summaries.length} summaries, nextToken=${nextToken ? "yes" : "no"}`);
 
+    const pageRows: InventoryRow[] = [];
     for (const s of summaries) {
       totalFetched++;
       const sku = (s.sellerSku as string | undefined)?.trim();
@@ -165,7 +219,7 @@ async function runInventorySync() {
         continue;
       }
 
-      rows.push({
+      pageRows.push({
         sku,
         fulfillable_quantity: fulfillable,
         inbound_working_quantity: working,
@@ -175,21 +229,24 @@ async function runInventorySync() {
         inventory_updated_at: nowIso,
       });
     }
+    totalMatched += pageRows.length;
+
+    for (let i = 0; i < pageRows.length; i += UPSERT_BATCH) {
+      const batch = pageRows.slice(i, i + UPSERT_BATCH);
+      const { error } = await sb
+        .from("listings")
+        .upsert(batch, { onConflict: "sku", ignoreDuplicates: false });
+      if (error) {
+        throw new Error(
+          "Upsert failed (page " + page + ", offset " + i + "): " + error.message,
+        );
+      }
+      totalUpserted += batch.length;
+    }
+    console.log(`Page ${page} upserted ${pageRows.length} rows (running total: ${totalUpserted})`);
   } while (nextToken);
 
-  console.log(`Fetched ${totalFetched} summaries, ${rows.length} matched, ${totalUnmatchedSkus} unmatched`);
-
-  let totalUpserted = 0;
-  for (let i = 0; i < rows.length; i += UPSERT_BATCH) {
-    const batch = rows.slice(i, i + UPSERT_BATCH);
-    const { error } = await sb
-      .from("listings")
-      .upsert(batch, { onConflict: "sku", ignoreDuplicates: false });
-    if (error) {
-      throw new Error("Upsert failed at offset " + i + ": " + error.message);
-    }
-    totalUpserted += batch.length;
-  }
+  console.log(`Fetched ${totalFetched} summaries, ${totalMatched} matched, ${totalUnmatchedSkus} unmatched`);
 
   const durationMs = Date.now() - started;
   const summary = { totalFetched, totalUpserted, totalUnmatchedSkus, durationMs };
