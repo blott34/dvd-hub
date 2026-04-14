@@ -722,6 +722,8 @@ async function queryAll(table, params = '') {
 // Cycle: 14 calendar days. Start = Monday of cycle. End = start + 11 (Friday of week 2).
 // Advances automatically every other Monday forever.
 const PAY_PERIOD_ANCHOR_MONDAY = '2026-03-30';
+// First real pay period — no periods before this Monday should ever appear.
+const FIRST_PAY_PERIOD_MONDAY = '2026-03-30';
 
 function getPayPeriodRange(anchorMondayISO) {
   const start = new Date(anchorMondayISO + 'T00:00:00');
@@ -746,10 +748,13 @@ function getCurrentPayPeriodMonday() {
 
 function listPayPeriodOptions(count) {
   const current = getCurrentPayPeriodMonday();
+  const floor = FIRST_PAY_PERIOD_MONDAY;
   const out = [];
   const d = new Date(current + 'T00:00:00');
   for (let i = 0; i < count; i++) {
     const iso = d.toISOString().split('T')[0];
+    // Always include the current period; skip older periods before the floor.
+    if (i > 0 && iso < floor) break;
     out.push({ monday: iso, range: getPayPeriodRange(iso) });
     d.setDate(d.getDate() - 14);
   }
