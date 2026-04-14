@@ -642,6 +642,34 @@
     .costs-grid { grid-template-columns: 1fr; }
     .emp-grid { grid-template-columns: 1fr; }
   }
+  .pay-period-filter {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 16px;
+    padding: 10px 14px;
+    background: #141414;
+    border: 1px solid #2a2a2a;
+    border-radius: 8px;
+  }
+  .pay-period-filter label {
+    color: #aaa;
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .pay-period-filter select {
+    background: #0a0a0a;
+    color: #e0e0e0;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 14px;
+    cursor: pointer;
+    min-width: 260px;
+  }
+  .pay-period-filter select:hover { border-color: #555; }
 </style>
 </head>
 <body>
@@ -690,25 +718,42 @@ async function queryAll(table, params = '') {
 }
 
 // Pay period: 10 work days, Monday through following Friday (2 calendar weeks).
-// Anchor: Monday March 16, 2026 is a known pay period start.
+// Anchor: Monday March 30, 2026 is a known pay period start.
 // Cycle: 14 calendar days. Start = Monday of cycle. End = start + 11 (Friday of week 2).
 // Advances automatically every other Monday forever.
-const PAY_PERIOD_ANCHOR = new Date('2026-03-16T00:00:00');
+const PAY_PERIOD_ANCHOR_MONDAY = '2026-03-30';
 
-function getPayPeriod() {
-  const now = new Date();
-  now.setHours(0, 0, 0, 0);
-  const diffMs = now.getTime() - PAY_PERIOD_ANCHOR.getTime();
-  const diffDays = Math.floor(diffMs / 86400000);
-  const cycleDay = ((diffDays % 14) + 14) % 14;
-  const start = new Date(now);
-  start.setDate(start.getDate() - cycleDay);
+function getPayPeriodRange(anchorMondayISO) {
+  const start = new Date(anchorMondayISO + 'T00:00:00');
   const end = new Date(start);
   end.setDate(end.getDate() + 11); // Monday + 11 = Friday of week 2
   return {
     start: start.toISOString().split('T')[0],
     end: end.toISOString().split('T')[0],
   };
+}
+
+function getCurrentPayPeriodMonday() {
+  const anchor = new Date(PAY_PERIOD_ANCHOR_MONDAY + 'T00:00:00');
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const diffDays = Math.floor((now.getTime() - anchor.getTime()) / 86400000);
+  const cycles = Math.floor(diffDays / 14);
+  const mon = new Date(anchor);
+  mon.setDate(mon.getDate() + cycles * 14);
+  return mon.toISOString().split('T')[0];
+}
+
+function listPayPeriodOptions(count) {
+  const current = getCurrentPayPeriodMonday();
+  const out = [];
+  const d = new Date(current + 'T00:00:00');
+  for (let i = 0; i < count; i++) {
+    const iso = d.toISOString().split('T')[0];
+    out.push({ monday: iso, range: getPayPeriodRange(iso) });
+    d.setDate(d.getDate() - 14);
+  }
+  return out;
 }
 
 function getWeekStart() {
@@ -903,8 +948,15 @@ let lastRepriceRun = null;
 let lastDailySync = null;
 let activeListingCount = 0;
 let currentOwnerTab = 'home';
+// Selected pay period Monday (ISO date). Defaults to current period.
+let selectedPayPeriodMonday = getCurrentPayPeriodMonday();
 // SKU filter for the repricer Listings tab: 'all' | 'dvdbox' | 'wiibox'
 let listingsSkuFilter = 'all';
+
+function onPayPeriodChange(monday) {
+  selectedPayPeriodMonday = monday;
+  loadDashboard();
+}
 
 function switchOwnerTab(tab) {
   currentOwnerTab = tab;
@@ -1421,7 +1473,13 @@ async function handleRefreshFromDb() {
 async function loadDashboard() {
   const today = todayISO();
   const sod = startOfDayISO();
-  const pp = getPayPeriod();
+  const currentMonday = getCurrentPayPeriodMonday();
+  // Guard against a stale selection after the calendar rolls forward.
+  if (new Date(selectedPayPeriodMonday) > new Date(currentMonday)) {
+    selectedPayPeriodMonday = currentMonday;
+  }
+  const pp = getPayPeriodRange(selectedPayPeriodMonday);
+  const isCurrentPP = selectedPayPeriodMonday === currentMonday;
   const weekStart = getWeekStart();
 
   // Initialize repricer data from Supabase
@@ -1433,15 +1491,15 @@ async function loadDashboard() {
     batches, shipCosts, supplies,
   ] = await Promise.all([
     query('daily_log', `select=result&timestamp=gte.${sod}`),
-    // Pay-period daily_log can exceed PostgREST's 1000-row cap across 10
-    // business days — paginate to get the true scan total.
-    queryAll('daily_log', `select=result,timestamp&timestamp=gte.${pp.start}T00:00:00&timestamp=lte.${pp.end}T23:59:59`),
+    // Pay-period scans can exceed PostgREST's 1000-row cap across 10
+    // business days — paginate to get the true totals.
+    queryAll('daily_log', `select=result,timestamp&timestamp=gte.${pp.start}T00:00:00&timestamp=lte.${pp.end}T23:59:59.999`),
     query('shipments_completed', `select=id&date=eq.${today}`),
-    query('shipments_completed', `select=id&date=gte.${pp.start}&date=lte.${pp.end}`),
+    queryAll('shipments_completed', `select=id&date=gte.${pp.start}&date=lte.${pp.end}`),
     query('timesheet', `select=*&date=eq.${today}&order=time_in.asc`),
-    query('timesheet', `select=*&date=gte.${pp.start}&date=lte.${pp.end}&order=time_in.asc`),
+    queryAll('timesheet', `select=*&date=gte.${pp.start}&date=lte.${pp.end}&order=time_in.asc`),
     query('shipments_ready', `select=*&order=timestamp.desc&limit=30`),
-    query('shipments_completed', `select=date,placement_fee,shipping_fee&date=gte.${pp.start}&date=lte.${pp.end}`),
+    queryAll('shipments_completed', `select=date,placement_fee,shipping_fee&date=gte.${pp.start}&date=lte.${pp.end}`),
     query('supply_tracker', `select=*&order=item.asc`),
   ]);
 
@@ -1493,6 +1551,14 @@ async function loadDashboard() {
     weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
   });
   const ppRange = fmtDateRange(pp.start, pp.end);
+  const payPeriodOptions = listPayPeriodOptions(13); // current + previous 12
+  const ppOptionsHtml = payPeriodOptions.map((o, i) => {
+    const label = i === 0
+      ? `Current pay period (${fmtDateRange(o.range.start, o.range.end)})`
+      : fmtDateRange(o.range.start, o.range.end);
+    const sel = o.monday === selectedPayPeriodMonday ? ' selected' : '';
+    return `<option value="${o.monday}"${sel}>${esc(label)}</option>`;
+  }).join('');
 
   const header = document.getElementById('header');
   header.style.display = '';
@@ -1500,7 +1566,7 @@ async function loadDashboard() {
     <h1>DVD Hub — Owner Dashboard</h1>
     <div class="page-meta">
       <span>${esc(dateStr)}</span>
-      <span>Pay Period: ${ppRange}</span>
+      <span>Pay Period: ${ppRange}${isCurrentPP ? '' : ' (viewing past)'}</span>
       <span>Auto-refreshes every 60s</span>
     </div>
   `;
@@ -1516,6 +1582,14 @@ async function loadDashboard() {
     <!-- HOME TAB -->
     <div id="owner-tab-home" class="owner-tab-content${currentOwnerTab === 'home' ? ' active' : ''}">
     <div class="content">
+      <!-- Pay Period selector -->
+      <div class="pay-period-filter">
+        <label for="payPeriodSelect">Pay Period:</label>
+        <select id="payPeriodSelect" onchange="onPayPeriodChange(this.value)">
+          ${ppOptionsHtml}
+        </select>
+      </div>
+
       <!-- Daily + Pay Period Overviews side by side -->
       <div class="row">
         <section class="section">
