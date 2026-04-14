@@ -817,18 +817,20 @@ async function callSpApi(action, params = {}) {
   return res.json();
 }
 
+// Columns actually read by the repricer UI. Do NOT use select=* here —
+// listings rows are wide and the repricer dashboard polls this endpoint
+// across many sessions, so fetching unused columns burns Supabase egress.
+const LISTINGS_COLUMNS = 'id,sku,asin,title,status,current_price,min_price,max_price,sales_rank,date_listed,last_repriced';
+
 // Load listings from Supabase listings table (local data with min/max/cost_basis).
 // Paginates past PostgREST's db-max-rows cap (default 1000) so we return ALL active
-// DVDBOX/WIIBOX listings. cache: 'no-store' + cache-buster prevents the browser from
-// serving a stale response after a reprice run has updated min/max in the DB.
+// DVDBOX/WIIBOX listings. Throws on non-2xx so the caller can back off.
 async function loadListingsFromDb() {
   const PAGE = 1000;
   const all = [];
   let offset = 0;
   while (true) {
-    // Do NOT add a query-string cache buster — PostgREST treats unknown params
-    // as column filters and returns 400. Use Cache-Control headers only.
-    const url = `${SUPABASE_URL}/rest/v1/listings?select=*&status=eq.active&or=(sku.ilike.*dvdbox*,sku.ilike.*wiibox*)&order=sku.asc`;
+    const url = `${SUPABASE_URL}/rest/v1/listings?select=${LISTINGS_COLUMNS}&status=eq.active&or=(sku.ilike.*dvdbox*,sku.ilike.*wiibox*)&order=sku.asc`;
     const res = await fetch(url, {
       cache: 'no-store',
       headers: {
@@ -839,6 +841,9 @@ async function loadListingsFromDb() {
         'Cache-Control': 'no-cache',
       },
     });
+    if (!res.ok && res.status !== 206) {
+      throw new Error(`listings fetch failed: ${res.status}`);
+    }
     const page = await res.json();
     if (!Array.isArray(page) || page.length === 0) break;
     all.push(...page);
@@ -858,7 +863,7 @@ async function loadRepricingLog() {
   // but individual timestamps may differ slightly. Use a 2-minute window.
   const latestTime = new Date(latest[0].timestamp);
   const windowStart = new Date(latestTime.getTime() - 120000).toISOString();
-  return await query('repricing_log', `select=*&order=timestamp.desc&timestamp=gte.${windowStart}`);
+  return await query('repricing_log', `select=timestamp,sku,asin,old_price,new_price,reason&order=timestamp.desc&timestamp=gte.${windowStart}`);
 }
 
 // Load repricing rules from Supabase
@@ -987,52 +992,74 @@ async function loadLatestDailySync() {
   return await query('sync_status', 'select=*&order=started_at.desc&limit=1');
 }
 
-// Load repricer data from Supabase on dashboard load
-async function initRepricerData() {
+// Polling gates for the repricer. Config endpoints are fetched once on mount
+// (and on user-initiated refresh). Listings are throttled to 5 minutes and
+// paused for 2 minutes on any fetch error to avoid storming a failing DB.
+const LISTINGS_POLL_MS = 5 * 60 * 1000;
+const LISTINGS_BACKOFF_MS = 2 * 60 * 1000;
+let repricerStaticLoaded = false;
+let lastListingsRefresh = 0;
+let listingsBackoffUntil = 0;
+
+// One-shot load of slow-moving config: rules, auto-reprice settings, last
+// reprice run, last daily sync. Runs once on mount; re-runs only when the
+// user hits the refresh button or saves a setting.
+async function initRepricerStaticOnce(force = false) {
+  if (repricerStaticLoaded && !force) return;
   try {
-    const [dbListings, dbLog, dbRules, arSettings, arRun, syncStatus, listingCount] = await Promise.all([
-      loadListingsFromDb(),
-      loadRepricingLog(),
+    const [dbRules, arSettings, arRun, syncStatus] = await Promise.all([
       loadRepricingRules(),
       loadAutoRepriceSettings(),
       loadLatestRepriceRun(),
       loadLatestDailySync(),
-      loadActiveListingCount(),
     ]);
-
-    activeListingCount = listingCount;
-
-    if (Array.isArray(dbListings) && dbListings.length > 0) {
-      repricerListings = dbListings;
-      repricerDataSource = 'db';
-    } else {
-      repricerDataSource = 'empty';
-    }
-
-    if (Array.isArray(dbLog)) {
-      repricerLog = dbLog;
-    }
-
-    if (Array.isArray(dbRules) && dbRules.length > 0) {
-      REPRICER_RULES = dbRules;
-    }
-
+    if (Array.isArray(dbRules) && dbRules.length > 0) REPRICER_RULES = dbRules;
     if (Array.isArray(arSettings) && arSettings.length > 0) {
       autoRepriceEnabled = arSettings[0].enabled;
       liveMode = arSettings[0].live_mode === true;
     }
-
-    if (Array.isArray(arRun) && arRun.length > 0) {
-      lastRepriceRun = arRun[0];
-    }
-
-    if (Array.isArray(syncStatus) && syncStatus.length > 0) {
-      lastDailySync = syncStatus[0];
-    }
+    if (Array.isArray(arRun) && arRun.length > 0) lastRepriceRun = arRun[0];
+    if (Array.isArray(syncStatus) && syncStatus.length > 0) lastDailySync = syncStatus[0];
+    repricerStaticLoaded = true;
   } catch (e) {
-    console.warn('Repricer DB load failed, using defaults:', e);
-    repricerDataSource = 'empty';
+    console.warn('Repricer static load failed, using defaults:', e);
   }
+}
+
+// Throttled refresh of listings + repricing log + active count. Respects
+// LISTINGS_POLL_MS and an error backoff. Pass force=true for manual refresh.
+async function refreshRepricerListings(force = false) {
+  const now = Date.now();
+  if (!force && now < listingsBackoffUntil) return;
+  if (!force && now - lastListingsRefresh < LISTINGS_POLL_MS) return;
+
+  try {
+    const [dbListings, dbLog, listingCount] = await Promise.all([
+      loadListingsFromDb(),
+      loadRepricingLog(),
+      loadActiveListingCount(),
+    ]);
+    activeListingCount = listingCount;
+    if (Array.isArray(dbListings) && dbListings.length > 0) {
+      repricerListings = dbListings;
+      repricerDataSource = 'db';
+    } else if (repricerListings.length === 0) {
+      repricerDataSource = 'empty';
+    }
+    if (Array.isArray(dbLog)) repricerLog = dbLog;
+    lastListingsRefresh = Date.now();
+  } catch (e) {
+    console.warn('Repricer listings refresh failed, backing off 2m:', e);
+    listingsBackoffUntil = Date.now() + LISTINGS_BACKOFF_MS;
+  }
+}
+
+// Manual / forced full reload (refresh button, post-sync, post-save).
+async function initRepricerData() {
+  await Promise.all([
+    initRepricerStaticOnce(true),
+    refreshRepricerListings(true),
+  ]);
 }
 
 function getNextSyncTime() {
@@ -1487,8 +1514,12 @@ async function loadDashboard() {
   const isCurrentPP = selectedPayPeriodMonday === currentMonday;
   const weekStart = getWeekStart();
 
-  // Initialize repricer data from Supabase
-  await initRepricerData();
+  // Repricer config loads once on mount; listings refresh on a 5-minute
+  // throttle (with a 2-minute error backoff) — not every 60s dashboard tick.
+  await Promise.all([
+    initRepricerStaticOnce(),
+    refreshRepricerListings(),
+  ]);
 
   const [
     todayLogs, ppLogs, shipDoneToday, shipDonePP,
@@ -1763,6 +1794,7 @@ async function loadDashboard() {
   `;
 }
 
+console.log('[repricer] listings poll interval:', LISTINGS_POLL_MS, 'ms; error backoff:', LISTINGS_BACKOFF_MS, 'ms');
 loadDashboard();
 setInterval(loadDashboard, 60000);
 </script>
