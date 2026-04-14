@@ -1797,6 +1797,34 @@ async function loadDashboard() {
 console.log('[repricer] listings poll interval:', LISTINGS_POLL_MS, 'ms; error backoff:', LISTINGS_BACKOFF_MS, 'ms');
 loadDashboard();
 setInterval(loadDashboard, 60000);
+
+// Auto-reload on deploy. /version.json is ~30 bytes, so 5-min polling costs
+// ~8 KB/client/day — negligible vs. the repricer listings traffic.
+let LOADED_VERSION = null;
+async function fetchVersion() {
+  const res = await fetch('/version.json', { cache: 'no-store' });
+  if (!res.ok) throw new Error('version fetch failed: ' + res.status);
+  return (await res.json()).version;
+}
+(async () => {
+  try {
+    LOADED_VERSION = await fetchVersion();
+    console.log('[version-check] initial version:', LOADED_VERSION);
+  } catch (e) {
+    console.warn('[version-check] initial load failed:', e.message);
+  }
+  setInterval(async () => {
+    try {
+      const current = await fetchVersion();
+      console.log('[version-check] loaded:', LOADED_VERSION, 'current:', current);
+      if (LOADED_VERSION && current && current !== LOADED_VERSION) {
+        window.location.reload();
+      }
+    } catch (e) {
+      console.warn('[version-check] check failed:', e.message);
+    }
+  }, 5 * 60 * 1000);
+})();
 </script>
 </body>
 </html>

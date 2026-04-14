@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Home, ScanLine, Truck, Package, Clock } from 'lucide-react';
 import { supabase } from '../lib/supabase';
+import { startVersionCheck } from '../lib/versionCheck';
 import ScannerHome from '../components/scanner/ScannerHome';
 import LogScan from '../components/scanner/LogScan';
 import Shipment from '../components/scanner/Shipment';
@@ -28,6 +29,7 @@ export default function ScannerDashboard({ onLogout }) {
     checkClockStatus();
     fetchTodayStats();
     fetchShipmentCount();
+    startVersionCheck();
   }, []);
 
   async function checkClockStatus() {

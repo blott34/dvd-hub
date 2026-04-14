@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Home, PackageCheck, Package, Clock } from 'lucide-react';
 import { supabase } from '../lib/supabase';
+import { startVersionCheck } from '../lib/versionCheck';
 import CleanerHome from '../components/cleaner/CleanerHome';
 import BatchReady from '../components/cleaner/BatchReady';
 import Supplies from '../components/shared/Supplies';
@@ -25,6 +26,7 @@ export default function CleanerDashboard({ onLogout }) {
   useEffect(() => {
     checkClockStatus();
     fetchTodayBatches();
+    startVersionCheck();
   }, []);
 
   async function checkClockStatus() {
