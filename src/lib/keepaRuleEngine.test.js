@@ -165,3 +165,61 @@ describe('Keepa rule engine — default fail', () => {
     expect(result.rule_triggered).toBe('no_lane_matched');
   });
 });
+
+describe('Keepa rule engine — PL-6 rank proxy (monthly_sold missing)', () => {
+  // avg90_rank set in tests 1-3 to reflect realistic Keepa responses:
+  // when current_rank is present, the rank-stats array is populated too. Without
+  // it, FF-4 (no_sales_history) would trip first and we'd never reach PL-6.
+  it('PL-6 triggers when monthly_sold is null but rank + BB are healthy (real production scan B0898Z8FC1)', () => {
+    const result = evaluateSnapshot(
+      snap({
+        current_bb: 1039,
+        avg90_bb: 922,
+        current_rank: 140_000,
+        avg90_rank: 140_000,
+        monthly_sold: null,
+      }),
+    );
+    expect(result.verdict).toBe('pass');
+    expect(result.rule_triggered).toBe('PL-6 rank_proxy_pass');
+  });
+
+  it('PL-6 does NOT trigger when rank is above the 200k ceiling', () => {
+    const result = evaluateSnapshot(
+      snap({
+        current_bb: 1039,
+        avg90_bb: 922,
+        current_rank: 350_000,
+        avg90_rank: 350_000,
+        monthly_sold: null,
+      }),
+    );
+    expect(result.verdict).toBe('fail');
+    expect(result.rule_triggered).toBe('no_lane_matched');
+  });
+
+  it('PL-6 does NOT trigger when current BB is below the $8.50 floor', () => {
+    const result = evaluateSnapshot(
+      snap({
+        current_bb: 750,
+        avg90_bb: 800,
+        current_rank: 100_000,
+        avg90_rank: 100_000,
+        monthly_sold: null,
+      }),
+    );
+    expect(result.verdict).toBe('fail');
+  });
+
+  it('PL-6 does NOT trigger when both current_rank and monthly_sold are null', () => {
+    const result = evaluateSnapshot(
+      snap({
+        current_bb: 1039,
+        avg90_bb: 922,
+        current_rank: null,
+        monthly_sold: null,
+      }),
+    );
+    expect(result.verdict).toBe('fail');
+  });
+});

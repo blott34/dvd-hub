@@ -38,6 +38,16 @@ const WAVE_MONTHLY_SOLD = 2;
 const SUPPRESSED_FBA_FLOOR_CENTS = 1000;
 const SUPPRESSED_AVG90_FLOOR_CENTS = 850;
 const SUPPRESSED_RANK = 500_000;
+const RANK_PROXY_BB_FLOOR_CENTS = 850;
+const RANK_PROXY_RANK = 200_000;
+const RANK_PROXY_AVG90_FLOOR_CENTS = 850;
+
+// Null/NaN-safe numeric check. `null <= 200000` coerces null to 0 and returns
+// true — silently matching ceilings on missing data. Every comparison below
+// must gate through isNum first.
+function isNum(v: unknown): v is number {
+  return typeof v === "number" && !isNaN(v);
+}
 
 interface Snapshot {
   current_bb: number | null;
@@ -62,60 +72,69 @@ interface RuleResult {
 
 function evaluateSnapshot(s: Snapshot): RuleResult {
   // Hard-fail floors
-  if (s.current_rank != null && s.current_rank > RANK_CEILING) {
+  if (isNum(s.current_rank) && s.current_rank > RANK_CEILING) {
     return { verdict: "fail", rule_triggered: "FF-1 rank_too_slow" };
   }
   if (
-    s.max_bb != null && s.max_bb < FLOOR_PRICE_CENTS &&
-    s.current_bb != null && s.current_bb >= 0 && s.current_bb < FLOOR_PRICE_CENTS
+    isNum(s.max_bb) && s.max_bb < FLOOR_PRICE_CENTS &&
+    isNum(s.current_bb) && s.current_bb >= 0 && s.current_bb < FLOOR_PRICE_CENTS
   ) {
     return { verdict: "fail", rule_triggered: "FF-2 always_below_floor" };
   }
   // FF-3 handled before this function (no active ASIN)
   if (
-    (s.monthly_sold == null || s.monthly_sold === 0) &&
-    s.avg90_rank == null &&
-    s.lowest_fba_cents == null
+    (!isNum(s.monthly_sold) || s.monthly_sold === 0) &&
+    !isNum(s.avg90_rank) &&
+    !isNum(s.lowest_fba_cents)
   ) {
     return { verdict: "fail", rule_triggered: "FF-4 no_sales_history" };
   }
 
   // Pass lanes
   if (
-    s.current_bb != null && s.current_bb >= STANDARD_PASS_PRICE_CENTS &&
-    s.current_rank != null && s.current_rank <= STANDARD_PASS_RANK &&
-    s.monthly_sold != null && s.monthly_sold >= STANDARD_PASS_MONTHLY_SOLD
+    isNum(s.current_bb) && s.current_bb >= STANDARD_PASS_PRICE_CENTS &&
+    isNum(s.current_rank) && s.current_rank <= STANDARD_PASS_RANK &&
+    isNum(s.monthly_sold) && s.monthly_sold >= STANDARD_PASS_MONTHLY_SOLD
   ) {
     return { verdict: "pass", rule_triggered: "PL-1 standard_pass" };
   }
   if (
-    s.monthly_sold != null && s.monthly_sold >= HIGH_MARGIN_MONTHLY_SOLD &&
-    s.avg180_bb != null && s.avg180_bb >= HIGH_MARGIN_AVG180_CENTS
+    isNum(s.monthly_sold) && s.monthly_sold >= HIGH_MARGIN_MONTHLY_SOLD &&
+    isNum(s.avg180_bb) && s.avg180_bb >= HIGH_MARGIN_AVG180_CENTS
   ) {
     return { verdict: "pass", rule_triggered: "PL-2 high_margin_slow_mover" };
   }
   if (
-    s.current_bb != null && s.current_bb >= 0 && s.current_bb < DIPPED_CURRENT_BB_CEILING_CENTS &&
-    s.avg90_bb != null && s.avg90_bb >= DIPPED_AVG90_FLOOR_CENTS &&
-    s.current_rank != null && s.current_rank <= DIPPED_RANK &&
-    s.monthly_sold != null && s.monthly_sold >= DIPPED_MONTHLY_SOLD
+    isNum(s.current_bb) && s.current_bb >= 0 && s.current_bb < DIPPED_CURRENT_BB_CEILING_CENTS &&
+    isNum(s.avg90_bb) && s.avg90_bb >= DIPPED_AVG90_FLOOR_CENTS &&
+    isNum(s.current_rank) && s.current_rank <= DIPPED_RANK &&
+    isNum(s.monthly_sold) && s.monthly_sold >= DIPPED_MONTHLY_SOLD
   ) {
     return { verdict: "pass", rule_triggered: "PL-3 dipped_but_historically_strong" };
   }
   if (
-    s.current_bb != null && s.current_bb >= WAVE_PRICE_CENTS &&
-    s.avg30_bb != null && s.avg30_bb >= WAVE_AVG30_CENTS &&
-    s.monthly_sold != null && s.monthly_sold >= WAVE_MONTHLY_SOLD
+    isNum(s.current_bb) && s.current_bb >= WAVE_PRICE_CENTS &&
+    isNum(s.avg30_bb) && s.avg30_bb >= WAVE_AVG30_CENTS &&
+    isNum(s.monthly_sold) && s.monthly_sold >= WAVE_MONTHLY_SOLD
   ) {
     return { verdict: "pass", rule_triggered: "PL-4 riding_the_wave" };
   }
   if (
     s.bb_suppressed &&
-    s.lowest_fba_cents != null && s.lowest_fba_cents >= SUPPRESSED_FBA_FLOOR_CENTS &&
-    s.avg90_bb != null && s.avg90_bb >= SUPPRESSED_AVG90_FLOOR_CENTS &&
-    s.current_rank != null && s.current_rank <= SUPPRESSED_RANK
+    isNum(s.lowest_fba_cents) && s.lowest_fba_cents >= SUPPRESSED_FBA_FLOOR_CENTS &&
+    isNum(s.avg90_bb) && s.avg90_bb >= SUPPRESSED_AVG90_FLOOR_CENTS &&
+    isNum(s.current_rank) && s.current_rank <= SUPPRESSED_RANK
   ) {
     return { verdict: "pass", rule_triggered: "PL-5 suppressed_bb_strong_fba" };
+  }
+  // PL-6: rank_proxy_pass — monthly_sold missing, use sales rank as velocity proxy
+  if (
+    !isNum(s.monthly_sold) &&
+    isNum(s.current_bb) && s.current_bb >= RANK_PROXY_BB_FLOOR_CENTS &&
+    isNum(s.current_rank) && s.current_rank <= RANK_PROXY_RANK &&
+    isNum(s.avg90_bb) && s.avg90_bb >= RANK_PROXY_AVG90_FLOOR_CENTS
+  ) {
+    return { verdict: "pass", rule_triggered: "PL-6 rank_proxy_pass" };
   }
 
   return { verdict: "fail", rule_triggered: "no_lane_matched" };
