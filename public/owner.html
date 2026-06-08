@@ -692,7 +692,7 @@ async function query(table, params = '') {
 
 // Paginated query — walks past PostgREST's db-max-rows cap (1000) by
 // requesting successive Range windows until a short page is returned.
-// Use for tables that can exceed 1000 rows per query (e.g. daily_log over
+// Use for tables that can exceed 1000 rows per query (e.g. scan_logs over
 // a multi-day pay period).
 async function queryAll(table, params = '') {
   const PAGE = 1000;
@@ -1526,10 +1526,10 @@ async function loadDashboard() {
     todayTimesheets, ppTimesheets,
     batches, shipCosts, supplies,
   ] = await Promise.all([
-    query('daily_log', `select=result&timestamp=gte.${sod}`),
+    query('scan_logs', `select=manual_verdict,automated_verdict&created_at=gte.${sod}`),
     // Pay-period scans can exceed PostgREST's 1000-row cap across 10
     // business days — paginate to get the true totals.
-    queryAll('daily_log', `select=result,timestamp&timestamp=gte.${pp.start}T00:00:00&timestamp=lte.${pp.end}T23:59:59.999`),
+    queryAll('scan_logs', `select=manual_verdict,automated_verdict,created_at&created_at=gte.${pp.start}T00:00:00&created_at=lte.${pp.end}T23:59:59.999`),
     query('shipments_completed', `select=id&date=eq.${today}`),
     queryAll('shipments_completed', `select=id&date=gte.${pp.start}&date=lte.${pp.end}`),
     query('timesheet', `select=*&date=eq.${today}&order=time_in.asc`),
@@ -1539,16 +1539,19 @@ async function loadDashboard() {
     query('supply_tracker', `select=*&order=item.asc`),
   ]);
 
+  // Effective verdict: manual takes priority, falls back to automated
+  const ev = r => r.manual_verdict || r.automated_verdict;
+
   // Daily overview
-  const passed = todayLogs.filter(r => r.result === 'Pass').length;
-  const failed = todayLogs.filter(r => r.result === 'Fail').length;
+  const passed = todayLogs.filter(r => ev(r) === 'pass').length;
+  const failed = todayLogs.filter(r => ev(r) === 'fail').length;
   const total = todayLogs.length;
   const passRate = total > 0 ? Math.round((passed / total) * 100) : 0;
   const shipCount = shipDoneToday.length;
 
   // Pay period overview
-  const ppPassed = ppLogs.filter(r => r.result === 'Pass').length;
-  const ppFailed = ppLogs.filter(r => r.result === 'Fail').length;
+  const ppPassed = ppLogs.filter(r => ev(r) === 'pass').length;
+  const ppFailed = ppLogs.filter(r => ev(r) === 'fail').length;
   const ppTotal = ppLogs.length;
   const ppRate = ppTotal > 0 ? Math.round((ppPassed / ppTotal) * 100) : 0;
   const ppShipCount = shipDonePP.length;

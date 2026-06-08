@@ -54,14 +54,15 @@ export default function ScannerDashboard({ onLogout }) {
     startOfDay.setHours(0, 0, 0, 0);
 
     const { data } = await supabase
-      .from('daily_log')
-      .select('result')
+      .from('scan_logs')
+      .select('manual_verdict, automated_verdict')
       .eq('employee', 'Scanner')
-      .gte('timestamp', startOfDay.toISOString());
+      .gte('created_at', startOfDay.toISOString());
 
     const rows = data || [];
-    const passed = rows.filter((r) => r.result === 'Pass').length;
-    const failed = rows.filter((r) => r.result === 'Fail').length;
+    const ev = (r) => r.manual_verdict || r.automated_verdict;
+    const passed = rows.filter((r) => ev(r) === 'pass').length;
+    const failed = rows.filter((r) => ev(r) === 'fail').length;
     const total = rows.length;
     const passRate = total > 0 ? Math.round((passed / total) * 100) : 0;
 
@@ -132,8 +133,8 @@ export default function ScannerDashboard({ onLogout }) {
 
   const handleScanLogged = useCallback((result) => {
     setStats((prev) => {
-      const passed = prev.passed + (result === 'Pass' ? 1 : 0);
-      const failed = prev.failed + (result === 'Fail' ? 1 : 0);
+      const passed = prev.passed + (result === 'pass' ? 1 : 0);
+      const failed = prev.failed + (result === 'fail' ? 1 : 0);
       const total = passed + failed;
       const passRate = total > 0 ? Math.round((passed / total) * 100) : 0;
       return { total, passed, failed, passRate };
