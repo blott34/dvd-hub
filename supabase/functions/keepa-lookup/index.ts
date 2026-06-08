@@ -49,6 +49,13 @@ function isNum(v: unknown): v is number {
   return typeof v === "number" && !isNaN(v);
 }
 
+// Keepa uses -1 as a "no data" sentinel on rank, BB, and price fields.
+// Normalize -1, 0, null, undefined, NaN all to null so an ascending sort
+// can't treat -1 as the best value. Canonical copy: src/lib/asinSelection.js.
+function keepaNum(v: unknown): number | null {
+  return typeof v === "number" && !isNaN(v) && v > 0 ? v : null;
+}
+
 interface Snapshot {
   current_bb: number | null;
   avg30_bb: number | null;
@@ -168,34 +175,86 @@ interface KeepaOffer {
   offerCSV?: number[];
 }
 
-function isActive(p: KeepaProduct): boolean {
-  const bb = p.stats?.current?.[18];
-  const hasBB = bb != null && bb > 0;
-  const hasRankAvg = p.stats?.avg30?.[3] != null;
-  const hasSales = (p.monthlySold ?? 0) > 0;
-  const hasOffers = (p.offers?.length ?? 0) > 0;
-  return hasBB || hasRankAvg || hasSales || hasOffers;
+// ============================================================================
+// UPC → ASIN selection (canonical copy: src/lib/asinSelection.js — keep in lockstep)
+// ============================================================================
+
+interface CandidateLog {
+  asin: string;
+  current_rank: number | null;
+  avg30_rank: number | null;
+  monthly_sold: number | null;
+  current_bb_cents: number | null;
+  offer_count: number;
+  passed_active_filter: boolean;
+  selected: boolean;
+}
+
+function normalizeCandidate(
+  p: KeepaProduct,
+): Omit<CandidateLog, "passed_active_filter" | "selected"> {
+  const ms = p.monthlySold;
+  return {
+    asin: p.asin,
+    current_rank: keepaNum(p.stats?.current?.[3]),
+    avg30_rank: keepaNum(p.stats?.avg30?.[3]),
+    // monthly_sold uses 0 as real data; don't keepaNum it
+    monthly_sold: typeof ms === "number" && !isNaN(ms) && ms >= 0 ? ms : null,
+    current_bb_cents: keepaNum(p.stats?.current?.[18]),
+    offer_count: Array.isArray(p.offers) ? p.offers.length : 0,
+  };
+}
+
+function isActiveCandidate(c: {
+  monthly_sold: number | null;
+  current_rank: number | null;
+}): boolean {
+  if (c.monthly_sold != null && c.monthly_sold > 0) return true;
+  if (c.current_rank != null) return true;
+  return false;
+}
+
+function compareCandidates(a: CandidateLog, b: CandidateLog): number {
+  const ra = a.current_rank ?? Infinity;
+  const rb = b.current_rank ?? Infinity;
+  if (ra !== rb) return ra - rb;
+
+  const ma = a.monthly_sold ?? 0;
+  const mb = b.monthly_sold ?? 0;
+  if (ma !== mb) return mb - ma;
+
+  const aa = a.avg30_rank ?? Infinity;
+  const ab = b.avg30_rank ?? Infinity;
+  if (aa !== ab) return aa - ab;
+
+  if (a.offer_count !== b.offer_count) return b.offer_count - a.offer_count;
+
+  return a.asin.localeCompare(b.asin);
 }
 
 function selectAsin(products: KeepaProduct[]): {
   winner: KeepaProduct | null;
-  candidates: string[];
+  candidates: CandidateLog[];
 } {
-  const candidates = products.map((p) => p.asin);
-  const active = products.filter(isActive);
-
-  if (active.length === 0) return { winner: null, candidates };
-
-  active.sort((a, b) => {
-    const soldDiff = (b.monthlySold ?? 0) - (a.monthlySold ?? 0);
-    if (soldDiff !== 0) return soldDiff;
-    // Ties: highest rank = lower number is better
-    const rankA = a.stats?.avg30?.[3] ?? Infinity;
-    const rankB = b.stats?.avg30?.[3] ?? Infinity;
-    return rankA - rankB;
+  const enriched: CandidateLog[] = products.map((p) => {
+    const info = normalizeCandidate(p);
+    return { ...info, passed_active_filter: isActiveCandidate(info), selected: false };
   });
 
-  return { winner: active[0], candidates };
+  const active = enriched.filter((c) => c.passed_active_filter);
+
+  if (active.length === 0) {
+    return { winner: null, candidates: enriched };
+  }
+
+  const sorted = [...active].sort(compareCandidates);
+  const winnerAsin = sorted[0].asin;
+  const winnerProduct = products.find((p) => p.asin === winnerAsin) ?? null;
+
+  return {
+    winner: winnerProduct,
+    candidates: enriched.map((c) => ({ ...c, selected: c.asin === winnerAsin })),
+  };
 }
 
 function extractLowestFba(offers: KeepaOffer[] | undefined): number | null {
@@ -216,23 +275,25 @@ function extractLowestFba(offers: KeepaOffer[] | undefined): number | null {
 }
 
 function buildSnapshot(p: KeepaProduct): Snapshot {
-  const currentBb = p.stats?.current?.[18] ?? null;
-  const lowestFba = extractLowestFba(p.offers);
-
+  // bb_suppressed is computed from the RAW value before normalization so the
+  // PL-5 suppressed-BB lane still fires. Everything else flows through
+  // keepaNum so -1 doesn't masquerade as a real price/rank.
+  const rawBb = p.stats?.current?.[18];
+  const ms = p.monthlySold;
   return {
-    current_bb: currentBb,
-    avg30_bb: p.stats?.avg30?.[18] ?? null,
-    avg90_bb: p.stats?.avg90?.[18] ?? null,
-    avg180_bb: p.stats?.avg180?.[18] ?? null,
-    min_bb: p.stats?.min?.[18] ?? null,
-    max_bb: p.stats?.max?.[18] ?? null,
-    current_new: p.stats?.current?.[1] ?? null,
-    current_rank: p.stats?.current?.[3] ?? null,
-    avg30_rank: p.stats?.avg30?.[3] ?? null,
-    avg90_rank: p.stats?.avg90?.[3] ?? null,
-    monthly_sold: p.monthlySold ?? null,
-    lowest_fba_cents: lowestFba,
-    bb_suppressed: currentBb === -1,
+    current_bb: keepaNum(rawBb),
+    avg30_bb: keepaNum(p.stats?.avg30?.[18]),
+    avg90_bb: keepaNum(p.stats?.avg90?.[18]),
+    avg180_bb: keepaNum(p.stats?.avg180?.[18]),
+    min_bb: keepaNum(p.stats?.min?.[18]),
+    max_bb: keepaNum(p.stats?.max?.[18]),
+    current_new: keepaNum(p.stats?.current?.[1]),
+    current_rank: keepaNum(p.stats?.current?.[3]),
+    avg30_rank: keepaNum(p.stats?.avg30?.[3]),
+    avg90_rank: keepaNum(p.stats?.avg90?.[3]),
+    monthly_sold: typeof ms === "number" && !isNaN(ms) && ms >= 0 ? ms : null,
+    lowest_fba_cents: extractLowestFba(p.offers),
+    bb_suppressed: rawBb === -1,
   };
 }
 
