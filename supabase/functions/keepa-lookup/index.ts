@@ -137,7 +137,7 @@ function evaluateSnapshot(s: Snapshot): RuleResult {
     return { verdict: "pass", rule_triggered: "PL-6 rank_proxy_pass" };
   }
 
-  return { verdict: "fail", rule_triggered: "no_lane_matched" };
+  return { verdict: "fail", rule_triggered: "borderline_default_fail" };
 }
 
 // ============================================================================

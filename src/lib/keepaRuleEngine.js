@@ -150,5 +150,5 @@ export function evaluateSnapshot(snapshot) {
   }
 
   // --- Default ---
-  return { verdict: 'fail', rule_triggered: 'no_lane_matched' };
+  return { verdict: 'fail', rule_triggered: 'borderline_default_fail' };
 }

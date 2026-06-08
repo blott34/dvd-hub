@@ -1,6 +1,13 @@
 import { useState, useEffect, useRef } from 'react';
 import { supabase } from '../../lib/supabase';
 
+// rAF runs after React commits and before the next paint — by then the DOM
+// reflects the latest state and the input is in its final focusable form.
+// setTimeout(0) would also work but rAF is the canonical "after-DOM-update" hook.
+function refocusInput(ref) {
+  requestAnimationFrame(() => ref.current?.focus());
+}
+
 export default function LogScan({ onScanLogged }) {
   const [feedback, setFeedback] = useState(null);
   const [passes, setPasses] = useState(0);
@@ -17,7 +24,7 @@ export default function LogScan({ onScanLogged }) {
   useEffect(() => {
     fetchTodayCounts();
     fetchAgreementStats();
-    if (inputRef.current) inputRef.current.focus();
+    refocusInput(inputRef);
   }, []);
 
   async function fetchTodayCounts() {
@@ -128,7 +135,7 @@ export default function LogScan({ onScanLogged }) {
     } finally {
       setLoading(false);
       setUpc('');
-      if (inputRef.current) inputRef.current.focus();
+      refocusInput(inputRef);
     }
   }
 
@@ -151,6 +158,8 @@ export default function LogScan({ onScanLogged }) {
     else setFails((f) => f + 1);
     setTimeout(() => setFeedback(null), 800);
     fetchAgreementStats();
+    setUpc('');
+    refocusInput(inputRef);
   }
 
   function formatPrice(cents) {
@@ -215,10 +224,16 @@ export default function LogScan({ onScanLogged }) {
             type="text"
             inputMode="numeric"
             value={upc}
-            onChange={(e) => setUpc(e.target.value)}
+            // gate onChange instead of disabling the input — a disabled input
+            // loses focus and cannot regain it via .focus(), which was the
+            // root cause of the bug. readOnly keeps it focusable; the onChange
+            // guard drops any stray scanner characters during the API call.
+            onChange={(e) => { if (!loading) setUpc(e.target.value); }}
             placeholder="Scan or type UPC..."
-            disabled={loading}
+            readOnly={loading}
             autoFocus
+            autoComplete="off"
+            spellCheck={false}
             style={{
               width: '100%',
               padding: 16,
@@ -241,6 +256,7 @@ export default function LogScan({ onScanLogged }) {
       {/* Verdict Banner */}
       {currentScan && !loading && (
         <div
+          tabIndex={-1}
           style={{
             padding: 16,
             borderRadius: 12,
@@ -249,6 +265,7 @@ export default function LogScan({ onScanLogged }) {
               ? '#fefce8'
               : (verdictColors[currentScan.verdict]?.bg || '#f1f5f9'),
             marginBottom: 16,
+            outline: 'none',
           }}
         >
           {showDisagreement ? (

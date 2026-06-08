@@ -147,7 +147,7 @@ describe('Keepa rule engine — hard-fail floors', () => {
 });
 
 describe('Keepa rule engine — default fail', () => {
-  it('no_lane_matched when no rule triggers', () => {
+  it('borderline_default_fail when no rule triggers', () => {
     // rank OK, BB above floor but below standard pass, monthlySold 1 (below all lanes)
     const result = evaluateSnapshot(
       snap({
@@ -162,7 +162,7 @@ describe('Keepa rule engine — default fail', () => {
       }),
     );
     expect(result.verdict).toBe('fail');
-    expect(result.rule_triggered).toBe('no_lane_matched');
+    expect(result.rule_triggered).toBe('borderline_default_fail');
   });
 });
 
@@ -195,7 +195,7 @@ describe('Keepa rule engine — PL-6 rank proxy (monthly_sold missing)', () => {
       }),
     );
     expect(result.verdict).toBe('fail');
-    expect(result.rule_triggered).toBe('no_lane_matched');
+    expect(result.rule_triggered).toBe('borderline_default_fail');
   });
 
   it('PL-6 does NOT trigger when current BB is below the $8.50 floor', () => {
